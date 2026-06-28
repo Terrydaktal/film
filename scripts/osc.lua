@@ -484,7 +484,11 @@ local function torrent_progress_ranges()
     local ranges = parse_torrent_ranges(content, "ranges")
     if #ranges > 0 then
         local capped_ranges = {}
-        local range_cap = playable_prefix and limit_range(0, 1, playable_prefix) or 1
+        local is_complete = downloaded >= total
+        local range_cap = 1
+        if not is_complete and playable_prefix then
+            range_cap = limit_range(0, 1, playable_prefix)
+        end
         for _, range in ipairs(ranges) do
             local range_start = limit_range(0, 1, range[1] / total) * 100
             local range_end = math.min(limit_range(0, 1, range[2] / total), range_cap) * 100
@@ -496,7 +500,9 @@ local function torrent_progress_ranges()
     end
 
     local fallback_ratio = nil
-    if playable_prefix then
+    if downloaded >= total then
+        fallback_ratio = 1
+    elseif playable_prefix then
         fallback_ratio = limit_range(0, 1, playable_prefix)
     elseif contiguous_prefix and contiguous_prefix > 0 then
         fallback_ratio = limit_range(0, 1, contiguous_prefix / total)
