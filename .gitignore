@@ -16,3 +16,8 @@ wheels/
 
 # Runtime torrent/media cache
 /stream_cache/
+
+# Scraper debug screenshots and ephemeral cache
+yandex_test.png
+yandex_post_click.png
+scraped_domains.json
