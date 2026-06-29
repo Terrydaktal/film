@@ -418,10 +418,18 @@ fn local_playback_guard(
     media_path: &std::path::Path,
 ) -> Result<(), String> {
     refresh_verified_torrent_progress_if_needed(cache_dir, media_path);
-    let (contiguous_prefix, total, playable_prefix) =
-        get_verified_local_playback_state(cache_dir).ok_or_else(|| {
-            "Local playback verification is unavailable for this file yet.".to_string()
-        })?;
+    if get_verified_local_playback_state(cache_dir).is_none() {
+        write_verified_torrent_progress_with_mode(cache_dir, media_path, true);
+    }
+    let verified_state = get_verified_local_playback_state(cache_dir);
+    let fallback_state = get_torrent_downloaded_and_total(cache_dir);
+    let ((contiguous_prefix, total), playable_prefix, used_fallback) = if let Some((contiguous_prefix, total, playable_prefix)) = verified_state {
+        ((contiguous_prefix, total), playable_prefix, false)
+    } else if let Some((downloaded_bytes, total)) = fallback_state {
+        ((downloaded_bytes, total), None, true)
+    } else {
+        return Err("Local playback verification is unavailable for this file yet.".to_string());
+    };
 
     if total == 0 {
         return Err("Local playback verification reported an empty media file.".to_string());
@@ -442,10 +450,15 @@ fn local_playback_guard(
     let playable_hint = playable_prefix
         .map(|ratio| format!(" Playable probe: {:.0}%.", ratio * 100.0))
         .unwrap_or_default();
+    let verification_hint = if used_fallback {
+        " Verified contiguous-range data is still warming up; using raw downloaded-byte fallback."
+    } else {
+        ""
+    };
 
     Err(format!(
-        "Refusing local playback: only the first {:.0} MiB ({:.1}%) is verified contiguous; need at least {:.0} MiB from the start.{}",
-        contiguous_mib, percent, required_mib, playable_hint
+        "Refusing local playback: only the first {:.0} MiB ({:.1}%) is available from the start; need at least {:.0} MiB from the start.{}{}",
+        contiguous_mib, percent, required_mib, playable_hint, verification_hint
     ))
 }
 
