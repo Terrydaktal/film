@@ -1,0 +1,10 @@
+# YIFY/YTS JSON API Mirrors — 9 found
+http://yts.ag
+http://yts.am
+http://yts.lt
+https://movies-api.accel.li
+https://yts.ag
+https://yts.am
+https://yts.bz
+https://yts.gg
+https://yts.lt

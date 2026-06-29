@@ -1150,11 +1150,36 @@ struct YtsMovie {
     torrents: Vec<YtsTorrent>,
 }
 
-fn load_mirrors() -> Vec<String> {
+#[derive(Deserialize, Debug)]
+struct MirrorSearchReportEntry {
+    domain: String,
+    effective_domain: String,
+    reason: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct MirrorSearchReport {
+    #[serde(default)]
+    api_successful: Vec<MirrorSearchReportEntry>,
+    #[serde(default)]
+    successful: Vec<MirrorSearchReportEntry>,
+    #[serde(default)]
+    failed: Vec<MirrorSearchReportEntry>,
+}
+
+fn load_search_mirrors() -> Vec<String> {
     let mut mirrors = Vec::new();
-    // Always prepend the official new API endpoint first
-    mirrors.push("https://movies-api.accel.li".to_string());
-    mirrors.push("https://yts.st".to_string());
+    if let Ok(content) = fs::read_to_string("yify_api_mirrors.txt") {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if !mirrors.iter().any(|existing| existing == line) {
+                mirrors.push(line.to_string());
+            }
+        }
+    }
 
     if let Ok(content) = fs::read_to_string("yify_mirrors.txt") {
         for line in content.lines() {
@@ -1175,6 +1200,104 @@ fn load_mirrors() -> Vec<String> {
     other_mirrors.sort_by_key(|m| !m.starts_with("https://"));
     mirrors.extend(other_mirrors);
     mirrors
+}
+
+fn load_diagnostic_recheck_mirrors() -> Vec<(String, MirrorStatusSource)> {
+    let mut mirrors = Vec::new();
+    if let Ok(content) = fs::read_to_string("yify_api_mirrors.txt") {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if !mirrors.iter().any(|(existing, _)| existing == line) {
+                mirrors.push((line.to_string(), MirrorStatusSource::LiveRecheckApi));
+            }
+        }
+    }
+    if let Ok(content) = fs::read_to_string("yify_mirrors.txt") {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if !mirrors.iter().any(|(existing, _)| existing == line) {
+                mirrors.push((line.to_string(), MirrorStatusSource::LiveRecheckHtml));
+            }
+        }
+    }
+    mirrors
+}
+
+fn load_report_only_diagnostic_statuses(
+    rechecked_mirrors: &[(String, MirrorStatusSource)],
+) -> Vec<MirrorStatus> {
+    let report_path = "yify_search_report.json";
+    let content = match fs::read_to_string(report_path) {
+        Ok(content) => content,
+        Err(_) => return Vec::new(),
+    };
+
+    let report: MirrorSearchReport = match serde_json::from_str(&content) {
+        Ok(report) => report,
+        Err(_) => return Vec::new(),
+    };
+
+    let should_skip = |url: &str| rechecked_mirrors.iter().any(|(mirror, _)| mirror == url);
+    let mut statuses = Vec::new();
+
+    for entry in report.api_successful {
+        let url = if entry.effective_domain.trim().is_empty() {
+            entry.domain.trim().to_string()
+        } else {
+            entry.effective_domain.trim().to_string()
+        };
+        if url.is_empty() || should_skip(&url) {
+            continue;
+        }
+        statuses.push(MirrorStatus {
+            url,
+            status: "API Searchable (Report)".to_string(),
+            detail: entry.reason,
+            source: MirrorStatusSource::CachedReportApi,
+        });
+    }
+
+    for entry in report.successful {
+        let url = if entry.effective_domain.trim().is_empty() {
+            entry.domain.trim().to_string()
+        } else {
+            entry.effective_domain.trim().to_string()
+        };
+        if url.is_empty() || should_skip(&url) {
+            continue;
+        }
+        statuses.push(MirrorStatus {
+            url,
+            status: "Searchable (Report)".to_string(),
+            detail: entry.reason,
+            source: MirrorStatusSource::CachedReportSearch,
+        });
+    }
+
+    for entry in report.failed {
+        let url = if entry.effective_domain.trim().is_empty() {
+            entry.domain.trim().to_string()
+        } else {
+            entry.effective_domain.trim().to_string()
+        };
+        if url.is_empty() {
+            continue;
+        }
+        statuses.push(MirrorStatus {
+            url,
+            status: "Search Verification Failed".to_string(),
+            detail: entry.reason,
+            source: MirrorStatusSource::CachedReportSearch,
+        });
+    }
+
+    statuses
 }
 
 fn percent_encode(text: &str) -> String {
@@ -1700,6 +1823,7 @@ fn check_single_mirror_status(agent: &ureq::Agent, mirror: &str) -> MirrorStatus
                             url: mirror.to_string(),
                             status: "Working (API)".to_string(),
                             detail: "Responds to list_movies API requests".to_string(),
+                            source: MirrorStatusSource::LiveRecheckHtml,
                         };
                     }
                 }
@@ -1726,6 +1850,7 @@ fn check_single_mirror_status(agent: &ureq::Agent, mirror: &str) -> MirrorStatus
                         url: mirror.to_string(),
                         status: "Redirected".to_string(),
                         detail: "Redirected to spam/parking page".to_string(),
+                        source: MirrorStatusSource::LiveRecheckHtml,
                     };
                 }
 
@@ -1737,17 +1862,42 @@ fn check_single_mirror_status(agent: &ureq::Agent, mirror: &str) -> MirrorStatus
                         url: mirror.to_string(),
                         status: "Cloudflare Block".to_string(),
                         detail: "Forces JavaScript browser verification".to_string(),
+                        source: MirrorStatusSource::LiveRecheckHtml,
                     };
                 }
 
-                if body.contains("class=\"browse-movie-wrap") 
-                    || body_lower.contains("yts") 
-                    || body_lower.contains("yify") 
+                if body_lower.contains("view full site")
+                    || body_lower.contains("continue to site")
+                    || body_lower.contains("go to site")
+                    || body_lower.contains("open full site")
+                    || body_lower.contains("visit full site")
                 {
+                    return MirrorStatus {
+                        url: mirror.to_string(),
+                        status: "Redirected".to_string(),
+                        detail: "Loads an intermediate gateway page instead of the actual YTS site".to_string(),
+                        source: MirrorStatusSource::LiveRecheckHtml,
+                    };
+                }
+
+                let has_search_results = body.contains("class=\"browse-movie-wrap")
+                    || body.contains("class='browse-movie-wrap")
+                    || body.contains("browse-movie-wrap");
+                let has_yts_shell = body.contains("browse-movie-link")
+                    || body.contains("browse-movie-title")
+                    || body.contains("browse-movie-year")
+                    || body.contains("movie-info")
+                    || body.contains("yts.mx")
+                    || body.contains("yts.lt")
+                    || body.contains("yts.rs")
+                    || body.contains("yify subtitles");
+
+                if has_search_results || has_yts_shell {
                     return MirrorStatus {
                         url: mirror.to_string(),
                         status: "Working (HTML)".to_string(),
                         detail: "Search UI works (successfully scraped via HTML fallback)".to_string(),
+                        source: MirrorStatusSource::LiveRecheckHtml,
                     };
                 }
 
@@ -1755,6 +1905,7 @@ fn check_single_mirror_status(agent: &ureq::Agent, mirror: &str) -> MirrorStatus
                     url: mirror.to_string(),
                     status: "Broken/Empty".to_string(),
                     detail: "Loads but doesn't contain YTS elements".to_string(),
+                    source: MirrorStatusSource::LiveRecheckHtml,
                 };
             }
         }
@@ -1780,6 +1931,7 @@ fn check_single_mirror_status(agent: &ureq::Agent, mirror: &str) -> MirrorStatus
                 url: mirror.to_string(),
                 status,
                 detail,
+                source: MirrorStatusSource::LiveRecheckHtml,
             };
         }
     }
@@ -1788,24 +1940,28 @@ fn check_single_mirror_status(agent: &ureq::Agent, mirror: &str) -> MirrorStatus
         url: mirror.to_string(),
         status: "Unknown Failure".to_string(),
         detail: "No response received".to_string(),
+        source: MirrorStatusSource::LiveRecheckHtml,
     }
 }
 
 fn run_mirror_diagnostics(
-    mirrors: Vec<String>,
+    mirrors: Vec<(String, MirrorStatusSource)>,
+    cached_report_statuses: Vec<MirrorStatus>,
     statuses: Arc<Mutex<Vec<MirrorStatus>>>,
     is_checking: Arc<Mutex<bool>>,
     ctx: egui::Context,
 ) {
     *is_checking.lock().unwrap() = true;
+    let recheck_offset = cached_report_statuses.len();
     {
         let mut list = statuses.lock().unwrap();
-        list.clear();
-        for m in &mirrors {
+        *list = cached_report_statuses;
+        for (m, source) in &mirrors {
             list.push(MirrorStatus {
                 url: m.clone(),
                 status: "Checking...".to_string(),
                 detail: String::new(),
+                source: source.clone(),
             });
         }
     }
@@ -1814,7 +1970,7 @@ fn run_mirror_diagnostics(
     let threads_count = mirrors.len();
     let completed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    for (idx, m) in mirrors.into_iter().enumerate() {
+    for (idx, (m, source)) in mirrors.into_iter().enumerate() {
         let statuses_clone = statuses.clone();
         let is_checking_clone = is_checking.clone();
         let completed_clone = completed_count.clone();
@@ -1830,8 +1986,12 @@ fn run_mirror_diagnostics(
 
             {
                 let mut list = statuses_clone.lock().unwrap();
-                if idx < list.len() {
-                    list[idx] = res;
+                let target_idx = recheck_offset + idx;
+                if target_idx < list.len() {
+                    list[target_idx] = MirrorStatus {
+                        source,
+                        ..res
+                    };
                 }
             }
             ctx_clone.request_repaint();
@@ -1911,11 +2071,20 @@ fn refresh_cached_seeds_and_peers(cache_dir: PathBuf, ctx: egui::Context) {
     });
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MirrorStatusSource {
+    CachedReportSearch,
+    CachedReportApi,
+    LiveRecheckHtml,
+    LiveRecheckApi,
+}
+
 #[derive(Clone, Debug)]
 struct MirrorStatus {
     url: String,
     status: String,
     detail: String,
+    source: MirrorStatusSource,
 }
 
 struct AppState {
@@ -2284,7 +2453,11 @@ impl eframe::App for AppState {
             if let Some(idx) = self.selected_idx {
                 if idx < self.movies.len() {
                     let group = self.movies[idx].clone();
-                    self.central_panel_rendering(ui, ctx, group);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.central_panel_rendering(ui, ctx, group);
+                        });
                 }
             } else {
                 ui.vertical(|ui| {
@@ -2299,6 +2472,14 @@ impl eframe::App for AppState {
                         ui.label("Diagnose which proxy mirrors are currently responding, blocked by Cloudflare, or offline.");
                         ui.add_space(8.0);
 
+                        if !*self.is_checking_mirrors.lock().unwrap()
+                            && self.mirror_statuses.lock().unwrap().is_empty()
+                        {
+                            let rechecked_mirrors = load_diagnostic_recheck_mirrors();
+                            *self.mirror_statuses.lock().unwrap() =
+                                load_report_only_diagnostic_statuses(&rechecked_mirrors);
+                        }
+
                         let is_checking = *self.is_checking_mirrors.lock().unwrap();
                         if is_checking {
                             ui.horizontal(|ui| {
@@ -2310,12 +2491,20 @@ impl eframe::App for AppState {
                             });
                         } else {
                             if ui.button("🔄 Run Diagnostics").clicked() {
-                                let mirrors = load_mirrors();
+                                let mirrors = load_diagnostic_recheck_mirrors();
+                                let cached_report_statuses =
+                                    load_report_only_diagnostic_statuses(&mirrors);
                                 let statuses_clone = self.mirror_statuses.clone();
                                 let is_checking_clone = self.is_checking_mirrors.clone();
                                 let ctx_clone = ctx.clone();
                                 thread::spawn(move || {
-                                    run_mirror_diagnostics(mirrors, statuses_clone, is_checking_clone, ctx_clone);
+                                    run_mirror_diagnostics(
+                                        mirrors,
+                                        cached_report_statuses,
+                                        statuses_clone,
+                                        is_checking_clone,
+                                        ctx_clone,
+                                    );
                                 });
                             }
                         }
@@ -2326,36 +2515,47 @@ impl eframe::App for AppState {
 
                         let list = self.mirror_statuses.lock().unwrap().clone();
                         if list.is_empty() {
-                            ui.label(egui::RichText::new("Click 'Run Diagnostics' to test mirror status.").italics().weak());
+                            ui.label(egui::RichText::new("No diagnostic report loaded yet. Run verify_yify_search.py, then reopen this view or click 'Run Diagnostics'.").italics().weak());
                         } else {
-                            let mut working_api = Vec::new();
-                            let mut working_html = Vec::new();
-                            let mut cf_block = Vec::new();
-                            let mut offline = Vec::new();
-                            let mut redirected = Vec::new();
-                            let mut other = Vec::new();
+                            let mut report_api = Vec::new();
+                            let mut report_searchable = Vec::new();
+                            let mut report_failed = Vec::new();
+                            let mut rechecked_working_api = Vec::new();
+                            let mut rechecked_working_html = Vec::new();
+                            let mut rechecked_cf_block = Vec::new();
+                            let mut rechecked_offline = Vec::new();
+                            let mut rechecked_redirected = Vec::new();
+                            let mut rechecked_other = Vec::new();
 
                             for item in list {
-                                match item.status.as_str() {
-                                    "Working (API)" => working_api.push(item),
-                                    "Working (HTML)" => working_html.push(item),
-                                    "Cloudflare Block" => cf_block.push(item),
-                                    "Redirected" => redirected.push(item),
-                                    "Checking..." => other.push(item),
-                                    _ => offline.push(item),
+                                match item.source {
+                                    MirrorStatusSource::CachedReportApi => report_api.push(item),
+                                    MirrorStatusSource::CachedReportSearch => match item.status.as_str() {
+                                        "Searchable (Report)" => report_searchable.push(item),
+                                        _ => report_failed.push(item),
+                                    },
+                                    MirrorStatusSource::LiveRecheckApi
+                                    | MirrorStatusSource::LiveRecheckHtml => match item.status.as_str() {
+                                        "Working (API)" => rechecked_working_api.push(item),
+                                        "Working (HTML)" => rechecked_working_html.push(item),
+                                        "Cloudflare Block" => rechecked_cf_block.push(item),
+                                        "Redirected" => rechecked_redirected.push(item),
+                                        "Checking..." => rechecked_other.push(item),
+                                        _ => rechecked_offline.push(item),
+                                    },
                                 }
                             }
 
                             egui::ScrollArea::vertical().show(ui, |ui| {
-                                if !working_api.is_empty() {
+                                if !rechecked_working_api.is_empty() {
                                     egui::CollapsingHeader::new(
-                                        egui::RichText::new(format!("🟢 Working JSON APIs ({})", working_api.len()))
+                                        egui::RichText::new(format!("🟢 Live Rechecked JSON APIs ({})", rechecked_working_api.len()))
                                             .color(egui::Color32::from_rgb(0, 220, 100))
                                             .strong()
                                     )
                                     .default_open(true)
                                     .show(ui, |ui| {
-                                        for m in &working_api {
+                                        for m in &rechecked_working_api {
                                             ui.horizontal(|ui| {
                                                 ui.label(egui::RichText::new(&m.url).strong());
                                                 ui.label(egui::RichText::new(&m.detail).weak().italics());
@@ -2364,15 +2564,15 @@ impl eframe::App for AppState {
                                     });
                                 }
 
-                                if !working_html.is_empty() {
+                                if !rechecked_working_html.is_empty() {
                                     egui::CollapsingHeader::new(
-                                        egui::RichText::new(format!("🔵 Working HTML Web Mirrors ({})", working_html.len()))
+                                        egui::RichText::new(format!("🔵 Live Rechecked HTML Mirrors ({})", rechecked_working_html.len()))
                                             .color(egui::Color32::from_rgb(100, 200, 255))
                                             .strong()
                                     )
                                     .default_open(true)
                                     .show(ui, |ui| {
-                                        for m in &working_html {
+                                        for m in &rechecked_working_html {
                                             ui.horizontal(|ui| {
                                                 ui.label(egui::RichText::new(&m.url).strong());
                                                 ui.label(egui::RichText::new(&m.detail).weak().italics());
@@ -2381,15 +2581,15 @@ impl eframe::App for AppState {
                                     });
                                 }
 
-                                if !cf_block.is_empty() {
+                                if !rechecked_cf_block.is_empty() {
                                     egui::CollapsingHeader::new(
-                                        egui::RichText::new(format!("🟡 Cloudflare JS Challenge active ({})", cf_block.len()))
+                                        egui::RichText::new(format!("🟡 Live Rechecked Cloudflare JS Challenge ({})", rechecked_cf_block.len()))
                                             .color(egui::Color32::from_rgb(250, 180, 50))
                                             .strong()
                                     )
                                     .default_open(false)
                                     .show(ui, |ui| {
-                                        for m in &cf_block {
+                                        for m in &rechecked_cf_block {
                                             ui.horizontal(|ui| {
                                                 ui.label(egui::RichText::new(&m.url).strong());
                                                 ui.label(egui::RichText::new(&m.detail).weak());
@@ -2398,15 +2598,15 @@ impl eframe::App for AppState {
                                     });
                                 }
 
-                                if !offline.is_empty() {
+                                if !rechecked_offline.is_empty() {
                                     egui::CollapsingHeader::new(
-                                        egui::RichText::new(format!("🔴 Dead / Offline / Failed ({})", offline.len()))
+                                        egui::RichText::new(format!("🔴 Live Rechecked Dead / Offline / Failed ({})", rechecked_offline.len()))
                                             .color(egui::Color32::from_rgb(250, 80, 80))
                                             .strong()
                                     )
                                     .default_open(false)
                                     .show(ui, |ui| {
-                                        for m in &offline {
+                                        for m in &rechecked_offline {
                                             ui.horizontal(|ui| {
                                                 ui.label(egui::RichText::new(&m.url).strong());
                                                 ui.label(egui::RichText::new(format!("{} - {}", m.status, m.detail)).weak());
@@ -2415,15 +2615,15 @@ impl eframe::App for AppState {
                                     });
                                 }
 
-                                if !redirected.is_empty() {
+                                if !rechecked_redirected.is_empty() {
                                     egui::CollapsingHeader::new(
-                                        egui::RichText::new(format!("⚪ Redirected / Spam / Parked ({})", redirected.len()))
+                                        egui::RichText::new(format!("⚪ Live Rechecked Redirected / Spam / Parked ({})", rechecked_redirected.len()))
                                             .color(egui::Color32::LIGHT_GRAY)
                                             .strong()
                                     )
                                     .default_open(false)
                                     .show(ui, |ui| {
-                                        for m in &redirected {
+                                        for m in &rechecked_redirected {
                                             ui.horizontal(|ui| {
                                                 ui.label(egui::RichText::new(&m.url).strong());
                                                 ui.label(egui::RichText::new(&m.detail).weak());
@@ -2432,14 +2632,65 @@ impl eframe::App for AppState {
                                     });
                                 }
 
-                                if !other.is_empty() {
+                                if !report_api.is_empty() {
                                     egui::CollapsingHeader::new(
-                                        egui::RichText::new(format!("⏳ Other / Checking ({})", other.len()))
+                                        egui::RichText::new(format!("📄 Search Report API Mirrors Not Rechecked ({})", report_api.len()))
+                                            .color(egui::Color32::from_rgb(120, 200, 255))
+                                            .strong()
+                                    )
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        for m in &report_api {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new(&m.url).strong());
+                                                ui.label(egui::RichText::new(&m.detail).weak());
+                                            });
+                                        }
+                                    });
+                                }
+
+                                if !report_searchable.is_empty() {
+                                    egui::CollapsingHeader::new(
+                                        egui::RichText::new(format!("📄 Search Report Searchable Mirrors Not Rechecked ({})", report_searchable.len()))
+                                            .color(egui::Color32::from_rgb(120, 210, 170))
+                                            .strong()
+                                    )
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        for m in &report_searchable {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new(&m.url).strong());
+                                                ui.label(egui::RichText::new(&m.detail).weak());
+                                            });
+                                        }
+                                    });
+                                }
+
+                                if !report_failed.is_empty() {
+                                    egui::CollapsingHeader::new(
+                                        egui::RichText::new(format!("📄 Search Report Failed Mirrors ({})", report_failed.len()))
+                                            .color(egui::Color32::from_rgb(210, 120, 120))
+                                            .strong()
+                                    )
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        for m in &report_failed {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new(&m.url).strong());
+                                                ui.label(egui::RichText::new(&m.detail).weak());
+                                            });
+                                        }
+                                    });
+                                }
+
+                                if !rechecked_other.is_empty() {
+                                    egui::CollapsingHeader::new(
+                                        egui::RichText::new(format!("⏳ Live Rechecked Other / Checking ({})", rechecked_other.len()))
                                             .color(egui::Color32::GRAY)
                                     )
                                     .default_open(true)
                                     .show(ui, |ui| {
-                                        for m in &other {
+                                        for m in &rechecked_other {
                                             ui.horizontal(|ui| {
                                                 ui.label(&m.url);
                                                 ui.label(egui::RichText::new(&m.status).weak());
@@ -2492,7 +2743,7 @@ impl eframe::App for AppState {
                                         results_clone.lock().unwrap().clear();
                                         
                                         thread::spawn(move || {
-                                            let mirrors = load_mirrors();
+                                            let mirrors = load_search_mirrors();
                                             if mirrors.is_empty() {
                                                 *status_clone.lock().unwrap() = "Error: yify_mirrors.txt not found!".to_string();
                                                 *is_searching_clone.lock().unwrap() = false;
@@ -2870,11 +3121,343 @@ impl PanelRenderHelper for AppState {
         // Quality Option Buttons at the top (from metadata.torrent_options)
         if let Some(torrent) = group.torrents.first() {
             let parent_cache_path = get_cache_dir().join(&torrent.dir_name);
+            let root_media = find_media_file(&parent_cache_path);
+            let root_has_torrent = parent_cache_path.join("movie.torrent").exists();
+            let root_is_active = {
+                let map = self.torrent_status.lock().unwrap();
+                map.get(&torrent.dir_name).map(|s| s.active).unwrap_or(false)
+            };
+            let root_hash = torrent.dir_name.strip_prefix("torrent_").map(|hash| hash.to_uppercase());
+            let root_has_local_status = root_has_torrent || root_media.is_some() || root_is_active;
+            if root_has_local_status {
+                ui.label(egui::RichText::new("Quality Options Local Status:").strong());
+                ui.add_space(6.0);
+                ui.group(|ui| {
+                    ui.vertical(|ui| {
+                        let label = torrent.metadata.as_ref()
+                            .and_then(|m| m.torrent_options.as_ref())
+                            .and_then(|opts| opts.first())
+                            .map(|opt| format!("Default Stream ({})", opt.quality))
+                            .unwrap_or_else(|| "Default Stream".to_string());
+
+                        ui.label(egui::RichText::new(label).strong());
+                        ui.add_space(4.0);
+
+                        if let Some(ref hash) = root_hash {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Info Hash:").strong());
+                                ui.label(hash);
+                            });
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Subfolder Path:").strong());
+                            ui.label(format!("./stream_cache/{}", torrent.dir_name));
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Disk Space Used:").strong());
+                            ui.label(format_size(torrent.total_size_bytes));
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Total File Size:").strong());
+                            ui.label(format_size(torrent.logical_size_bytes));
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Subtitles:").strong());
+                            let cached_langs = cached_subtitle_languages(&parent_cache_path);
+                            if !cached_langs.is_empty() {
+                                let summary = format_subtitle_summary(&cached_langs);
+                                ui.label(
+                                    egui::RichText::new(format!("Available (cached): {}", summary))
+                                        .color(egui::Color32::from_rgb(0, 200, 100))
+                                        .strong(),
+                                );
+                            } else {
+                                match torrent_subtitle_languages(&parent_cache_path) {
+                                    Some(langs) if !langs.is_empty() => {
+                                        let summary = format_subtitle_summary(&langs);
+                                        ui.label(
+                                            egui::RichText::new(format!("In torrent: {}", summary))
+                                                .color(egui::Color32::from_rgb(200, 160, 0))
+                                                .strong(),
+                                        );
+                                    }
+                                    Some(_) => {
+                                        ui.label(egui::RichText::new("None in torrent").weak());
+                                    }
+                                    None => {
+                                        ui.label(egui::RichText::new("Unknown (start torrent to check)").weak());
+                                    }
+                                }
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Torrented Status:").strong());
+                            let per_status = {
+                                let map = self.torrent_status.lock().unwrap();
+                                map.get(&torrent.dir_name).cloned()
+                            };
+
+                            if let Some(ref s) = per_status {
+                                if s.active {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} / {} (⬇ {} · {} peers)",
+                                            s.downloaded,
+                                            format_size(torrent.total_size_bytes),
+                                            s.speed,
+                                            s.peers
+                                        ))
+                                        .color(egui::Color32::from_rgb(0, 220, 100))
+                                        .strong(),
+                                    );
+                                } else if let Some((dl, total)) = get_torrent_downloaded_and_total(&parent_cache_path) {
+                                    let pct = if total > 0 { (dl as f64 / total as f64) * 100.0 } else { 0.0 };
+                                    ui.label(format!("{} / {} ({:.2}%)", format_size(dl), format_size(total), pct));
+                                } else {
+                                    ui.label(format!("0 B / {} (0.00%)", format_size(torrent.total_size_bytes)));
+                                }
+                            } else if let Some((dl, total)) = get_torrent_downloaded_and_total(&parent_cache_path) {
+                                let pct = if total > 0 { (dl as f64 / total as f64) * 100.0 } else { 0.0 };
+                                ui.label(format!("{} / {} ({:.2}%)", format_size(dl), format_size(total), pct));
+                            } else {
+                                ui.label(format!("0 B / {} (0.00%)", format_size(torrent.total_size_bytes)));
+                            }
+                        });
+
+                        if let Some(ref path) = root_media {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new("Largest Media File:").strong());
+                                ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                            });
+                        }
+
+                        ui.add_space(8.0);
+
+                        ui.horizontal(|ui| {
+                            let is_this_active = {
+                                let map = self.torrent_status.lock().unwrap();
+                                map.get(&torrent.dir_name).map(|s| s.active).unwrap_or(false)
+                            };
+
+                            if is_this_active {
+                                let stop_btn = ui.add_sized(
+                                    [160.0, 40.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("⏹ Stop Torrent")
+                                            .font(egui::FontId::proportional(14.0))
+                                            .strong(),
+                                    )
+                                    .fill(egui::Color32::from_rgb(180, 40, 40)),
+                                );
+                                if stop_btn.clicked() {
+                                    let dir_to_stop = torrent.dir_name.clone();
+                                    let children_clone = self.spawned_children.clone();
+                                    let torrent_status_clone = self.torrent_status.clone();
+                                    thread::spawn(move || {
+                                        let mut children = children_clone.lock().unwrap();
+                                        for child in children.iter_mut() {
+                                            let _ = child.kill();
+                                        }
+                                        children.clear();
+                                        let _ = Command::new("pkill")
+                                            .args(&["-9", "-i", "-f", "webtorrent"])
+                                            .status();
+                                        let mut map = torrent_status_clone.lock().unwrap();
+                                        if let Some(s) = map.get_mut(&dir_to_stop) {
+                                            s.active = false;
+                                        }
+                                    });
+                                    self.status_message = "Stopping torrent...".to_string();
+                                }
+                            } else {
+                                let start_btn = ui.add_sized(
+                                    [160.0, 40.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("🧲 Start Torrent")
+                                            .font(egui::FontId::proportional(14.0))
+                                            .strong(),
+                                    )
+                                    .fill(egui::Color32::from_rgb(0, 160, 80)),
+                                );
+                                if start_btn.clicked() {
+                                    let url_to_play = torrent.metadata.as_ref().map(|m| m.url.clone()).unwrap_or_default();
+                                    let dir_to_play = torrent.dir_name.clone();
+                                    let children_clone = self.spawned_children.clone();
+                                    let torrent_status_clone = self.torrent_status.clone();
+                                    let ctx_clone = ctx.clone();
+                                    thread::spawn(move || {
+                                        let mut children = children_clone.lock().unwrap();
+
+                                        let dest = format!("./stream_cache/{}", dir_to_play);
+                                        let dest_dir = PathBuf::from(&dest);
+                                        let local_torrent_path = format!("./stream_cache/{}/movie.torrent", dir_to_play);
+                                        let mut torrent_source = url_to_play.clone();
+
+                                        let _ = fs::create_dir_all(&dest_dir);
+
+                                        if std::path::Path::new(&local_torrent_path).exists() {
+                                            torrent_source = local_torrent_path;
+                                        } else if let Some(h) = get_infohash(&url_to_play) {
+                                            let torrent_url = format!("https://itorrents.net/torrent/{}.torrent", h);
+                                            let download_res = Command::new("curl")
+                                                .args(&["-s", "-L", "-o", &local_torrent_path, &torrent_url])
+                                                .status();
+                                            if download_res.is_ok() && std::path::Path::new(&local_torrent_path).exists() {
+                                                torrent_source = local_torrent_path;
+                                            }
+                                        }
+
+                                        {
+                                            let mut map = torrent_status_clone.lock().unwrap();
+                                            map.insert(dir_to_play.clone(), PerTorrentStatus {
+                                                active: true,
+                                                speed: "Connecting...".to_string(),
+                                                downloaded: "0 MB".to_string(),
+                                                peers: "0/0".to_string(),
+                                            });
+                                        }
+                                        ctx_clone.request_repaint();
+
+                                        write_torrent_progress(&dest_dir, "0 B");
+                                        spawn_gap_aware_progress_scanner(
+                                            dest_dir.clone(),
+                                            dir_to_play.clone(),
+                                            torrent_status_clone.clone(),
+                                        );
+
+                                        let free_port = get_free_port().unwrap_or(8080);
+                                        let mut cmd = Command::new("npx");
+                                        cmd.args(&[
+                                            "-y",
+                                            "webtorrent-cli",
+                                            "download",
+                                            &torrent_source,
+                                            "--port",
+                                            &free_port.to_string(),
+                                            "--out",
+                                            &dest,
+                                        ]);
+                                        cmd.stdout(std::process::Stdio::piped());
+                                        cmd.stderr(std::process::Stdio::piped());
+
+                                        let spawn_res = cmd.spawn();
+                                        if let Ok(mut child) = spawn_res {
+                                            let _child_pid = child.id();
+                                            if let Some(stderr) = child.stderr.take() {
+                                                let err_reader = std::io::BufReader::new(stderr);
+                                                thread::spawn(move || {
+                                                    for line_res in err_reader.lines().flatten() {
+                                                        if !line_res.trim().is_empty() {
+                                                            println!("[WEBTORRENT ERR] {}", line_res);
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                            if let Some(stdout) = child.stdout.take() {
+                                                let reader = std::io::BufReader::new(stdout);
+                                                let status_clone_2 = torrent_status_clone.clone();
+                                                let ctx_clone_2 = ctx_clone.clone();
+                                                let progress_dir = dest_dir.clone();
+                                                let progress_dir_name = dir_to_play.clone();
+                                                thread::spawn(move || {
+                                                    let mut buffer = String::new();
+                                                    let mut br = std::io::BufReader::new(reader);
+                                                    while let Ok(bytes) = br.read_line(&mut buffer) {
+                                                        if bytes == 0 {
+                                                            break;
+                                                        }
+                                                        if is_webtorrent_seeding_line(&buffer) {
+                                                            let mut map = status_clone_2.lock().unwrap();
+                                                            if let Some(s) = map.get_mut(&progress_dir_name) {
+                                                                s.active = false;
+                                                            }
+                                                            ctx_clone_2.request_repaint();
+                                                            break;
+                                                        }
+                                                        if let Some((speed, downloaded, peers)) = parse_webtorrent_line(&buffer) {
+                                                            write_torrent_progress(&progress_dir, &downloaded);
+                                                            let mut map = status_clone_2.lock().unwrap();
+                                                            if let Some(s) = map.get_mut(&progress_dir_name) {
+                                                                s.speed = speed;
+                                                                s.downloaded = downloaded;
+                                                                s.peers = peers;
+                                                            }
+                                                            ctx_clone_2.request_repaint();
+                                                        }
+                                                        buffer.clear();
+                                                    }
+                                                });
+                                            }
+                                            children.push(child);
+                                        }
+                                    });
+                                    self.status_message = "Starting torrent download...".to_string();
+                                }
+                            }
+
+                            if let Some(media_path) = root_media.clone() {
+                                let play_local_btn = ui.add_sized(
+                                    [160.0, 40.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("▶ Play Local File")
+                                            .font(egui::FontId::proportional(14.0))
+                                            .strong(),
+                                    )
+                                    .fill(egui::Color32::from_rgb(0, 120, 200)),
+                                );
+                                if play_local_btn.clicked() {
+                                    match local_playback_guard(&parent_cache_path, &media_path) {
+                                        Ok(()) => {
+                                            let path_str = media_path.to_str().unwrap_or_default().to_string();
+                                            let progress_file = progress_file_path(&parent_cache_path);
+                                            let children_clone = self.spawned_children.clone();
+                                            thread::spawn(move || {
+                                                let mut cmd = Command::new("mpv");
+                                                cmd.args(direct_mpv_args(&progress_file));
+                                                cmd.arg(&path_str);
+                                                if let Ok(child) = cmd.spawn() {
+                                                    children_clone.lock().unwrap().push(child);
+                                                }
+                                            });
+                                            self.status_message = "Opened verified local file in mpv.".to_string();
+                                        }
+                                        Err(reason) => {
+                                            self.status_message = reason;
+                                        }
+                                    }
+                                }
+
+                                let delete_file_btn = ui.add_sized(
+                                    [150.0, 40.0],
+                                    egui::Button::new("🗑 Delete File")
+                                        .fill(egui::Color32::from_rgb(145, 70, 35)),
+                                );
+                                if delete_file_btn.clicked() {
+                                    delete_local_media_file(&parent_cache_path, &media_path);
+                                    self.refresh();
+                                }
+                            }
+                        });
+                    });
+                });
+                ui.add_space(8.0);
+            }
+
             if let Some(ref meta) = torrent.metadata {
                 if let Some(ref options) = meta.torrent_options {
                     ui.label(egui::RichText::new("Choose Stream Quality Option:").strong());
                     ui.add_space(4.0);
                     for opt in options {
+                        if root_has_local_status
+                            && root_hash.as_deref() == Some(opt.hash.to_uppercase().as_str())
+                        {
+                            continue;
+                        }
                         let quality_path = parent_cache_path.join(&opt.quality);
                         let local_media = find_media_file(&quality_path);
                         let hash = opt.hash.to_uppercase();
@@ -3122,24 +3705,44 @@ impl PanelRenderHelper for AppState {
             }
         }
  
-        ui.label(egui::RichText::new("Quality Options Local Status:").strong());
-        ui.add_space(6.0);
- 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if let Some(torrent) = group.torrents.first() {
-                let parent_cache_path = get_cache_dir().join(&torrent.dir_name);
+        if let Some(torrent) = group.torrents.first() {
+            let parent_cache_path = get_cache_dir().join(&torrent.dir_name);
+            let show_quality_local_status = if let Some(ref meta) = torrent.metadata {
+                if let Some(ref options) = meta.torrent_options {
+                    options.iter().any(|opt| {
+                        let quality_path = parent_cache_path.join(&opt.quality);
+                        let local_media = find_media_file(&quality_path);
+                        let has_torrent = quality_path.join("movie.torrent").exists();
+                        let is_active = {
+                            let map = self.torrent_status.lock().unwrap();
+                            map.get(&opt.hash.to_uppercase()).map(|s| s.active).unwrap_or(false)
+                        };
+                        has_torrent || local_media.is_some() || is_active
+                    })
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if show_quality_local_status {
+                ui.label(egui::RichText::new("Additional Quality Options Local Status:").strong());
+                ui.add_space(6.0);
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
                 
-                let mut rendered_any = false;
-                if let Some(ref meta) = torrent.metadata {
-                    if let Some(ref options) = meta.torrent_options {
-                        for opt in options {
-                            let quality_path = parent_cache_path.join(&opt.quality);
-                            let local_media = find_media_file(&quality_path);
-                            let has_torrent = quality_path.join("movie.torrent").exists();
-                            let is_active = {
-                                let map = self.torrent_status.lock().unwrap();
-                                map.get(&opt.hash.to_uppercase()).map(|s| s.active).unwrap_or(false)
-                            };
+                    let mut rendered_any = false;
+                    if let Some(ref meta) = torrent.metadata {
+                        if let Some(ref options) = meta.torrent_options {
+                            for opt in options {
+                                let quality_path = parent_cache_path.join(&opt.quality);
+                                let local_media = find_media_file(&quality_path);
+                                let has_torrent = quality_path.join("movie.torrent").exists();
+                                let is_active = {
+                                    let map = self.torrent_status.lock().unwrap();
+                                    map.get(&opt.hash.to_uppercase()).map(|s| s.active).unwrap_or(false)
+                                };
  
                             if has_torrent || local_media.is_some() || is_active {
                                 rendered_any = true;
@@ -3629,11 +4232,13 @@ impl PanelRenderHelper for AppState {
                     ui.add_space(8.0);
                 }
  
-                if !rendered_any {
-                    ui.label(egui::RichText::new("No active streams or downloaded files for this movie yet. Click one of the stream quality buttons at the top to start downloading!").weak().italics());
-                    ui.add_space(8.0);
-                }
- 
+                    if !rendered_any {
+                        ui.label(egui::RichText::new("No active streams or downloaded files for this movie yet. Click one of the stream quality buttons at the top to start downloading!").weak().italics());
+                        ui.add_space(8.0);
+                    }
+            });
+        }
+
                 // Delete entire film library item
                 ui.separator();
                 ui.add_space(8.0);
@@ -3677,7 +4282,6 @@ impl PanelRenderHelper for AppState {
                     self.refresh();
                 }
             }
-        });
     }
 }
 
