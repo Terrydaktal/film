@@ -8,6 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+node_modules/
 
 
 # Added by cargo
@@ -22,3 +23,5 @@ yandex_test.png
 yandex_post_click.png
 Screenshot_*.png
 scraped_domains.json
+scratch_*.html
+yts_*.html
