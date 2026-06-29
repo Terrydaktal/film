@@ -7,10 +7,12 @@ import re
 from urllib.parse import urljoin, urlparse
 
 from find_yify_sites import (
+    BLOCKLIST,
     CHATBOT_SESSION_FILE,
     DOMAIN_CACHE_FILE,
     FULL_SITE_TEXT_MARKERS,
     SEARCH_PROBE_QUERY,
+    SKIP_DOMAINS,
     async_playwright,
     fetch_url_with_optional_doh,
     normalize_site_url,
@@ -27,6 +29,68 @@ def load_stage1_cache():
         return json.load(f)
 
 
+def load_existing_report():
+    if not os.path.exists(REPORT_OUTPUT_FILE):
+        return {}
+    try:
+        with open(REPORT_OUTPUT_FILE, "r") as f:
+            report = json.load(f)
+    except Exception:
+        return {}
+
+    entries = {}
+    for item in report.get("successful", []):
+        if item.get("domain"):
+            entries[item["domain"]] = item
+    for item in report.get("failed", []):
+        if item.get("domain"):
+            entries[item["domain"]] = item
+    return entries
+
+
+def load_existing_url_list(path):
+    if not os.path.exists(path):
+        return []
+    urls = []
+    seen = set()
+    with open(path, "r") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line in seen:
+                continue
+            seen.add(line)
+            urls.append(line)
+    return urls
+
+
+def merge_preserving_order(existing_urls, new_urls):
+    merged = []
+    seen = set()
+    for url in list(existing_urls) + list(new_urls):
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        merged.append(url)
+    return merged
+
+
+def normalize_target_url(base_url, href):
+    if not href:
+        return None
+    absolute = urljoin(f"{base_url.rstrip('/')}/", href.strip())
+    parsed = urlparse(absolute)
+    hostname = parsed.hostname.lower() if parsed.hostname else ""
+    if not parsed.scheme or not hostname:
+        return None
+    if any(skip in hostname for skip in SKIP_DOMAINS) or hostname in BLOCKLIST:
+        return None
+    port = f":{parsed.port}" if parsed.port else ""
+    path = parsed.path or ""
+    query = f"?{parsed.query}" if parsed.query else ""
+    normalized = f"{parsed.scheme}://{hostname}{port}{path}{query}"
+    return normalized.rstrip("/") if path not in ("", "/") and not query else normalized
+
+
 def extract_full_site_targets(base_url, html):
     targets = []
     seen = set()
@@ -37,9 +101,7 @@ def extract_full_site_targets(base_url, html):
         if not any(marker in text for marker in FULL_SITE_TEXT_MARKERS):
             continue
 
-        if href.startswith("/"):
-            href = f"{base_url.rstrip('/')}{href}"
-        normalized = normalize_site_url(href)
+        normalized = normalize_target_url(base_url, href)
         if not normalized or normalized in seen:
             continue
         seen.add(normalized)
@@ -51,17 +113,16 @@ def extract_full_site_targets(base_url, html):
 def extract_linked_yts_targets(base_url, html):
     targets = []
     seen = set()
+    accept_all_links = "yify" in base_url.lower()
 
     for match in re.finditer(r'(?is)<a\b([^>]*)href=["\']([^"\']+)["\']([^>]*)>(.*?)</a>', html):
         href = match.group(2).strip()
-        if href.startswith("/"):
-            href = f"{base_url.rstrip('/')}{href}"
-        normalized = normalize_site_url(href)
+        normalized = normalize_target_url(base_url, href)
         if not normalized or normalized in seen:
             continue
 
         netloc = urlparse(normalized).netloc.lower()
-        if "yts" not in netloc and "yify" not in netloc:
+        if not accept_all_links and "yts" not in netloc and "yify" not in netloc:
             continue
 
         seen.add(normalized)
@@ -346,18 +407,33 @@ def main():
         default=20,
         help="Number of parallel verification workers",
     )
+    parser.add_argument(
+        "--skip-known",
+        action="store_true",
+        help="Skip gathered domains that already have a status entry in yify_search_report.json",
+    )
     args = parser.parse_args()
 
     cache = load_stage1_cache()
     all_domains = cache.get("all_domains", [])
     stage2_mirrors = set(cache.get("stage2_mirrors", []))
+    existing_report_entries = load_existing_report()
+    existing_success_urls = load_existing_url_list(SUCCESS_OUTPUT_FILE)
+    existing_api_urls = load_existing_url_list(API_OUTPUT_FILE)
 
     clean_domains = sorted(set(all_domains))
-    print(f"[*] Loaded {len(clean_domains)} gathered domains from {DOMAIN_CACHE_FILE}")
+    loaded_total = len(clean_domains)
+    print(f"[*] Loaded {loaded_total} gathered domains from {DOMAIN_CACHE_FILE}")
+    if args.skip_known:
+        original_total = len(clean_domains)
+        clean_domains = [domain for domain in clean_domains if domain not in existing_report_entries]
+        print(f"[*] --skip-known reduced work from {original_total} to {len(clean_domains)} domains")
 
     results = []
     total_domains = len(clean_domains)
     completed = 0
+    if total_domains == 0:
+        print("[*] No domains left to verify in this run.")
     print(f"[*] Verifying search behavior for {total_domains} domains with {args.workers} workers...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
         future_to_domain = {
@@ -442,16 +518,21 @@ def main():
                 )
                 break
 
+    merged_entries = dict(existing_report_entries)
+    for result in results:
+        merged_entries[result["domain"]] = result
+
+    merged_results = list(merged_entries.values())
     succeeded = sorted(
-        [r for r in results if r["searchable"] and r["inferred_yify_domain"]],
+        [r for r in merged_results if r["searchable"] and r["inferred_yify_domain"]],
         key=lambda item: item["domain"],
     )
     failed = sorted(
-        [r for r in results if not (r["searchable"] and r["inferred_yify_domain"])],
+        [r for r in merged_results if not (r["searchable"] and r["inferred_yify_domain"])],
         key=lambda item: item["domain"],
     )
     api_succeeded = sorted(
-        [r for r in results if r["api_supported"] and r["inferred_yify_domain"]],
+        [r for r in merged_results if r["api_supported"] and r["inferred_yify_domain"]],
         key=lambda item: item["api_effective_domain"],
     )
     unique_api_domains = []
@@ -463,23 +544,30 @@ def main():
         seen_api.add(api_domain)
         unique_api_domains.append(api_domain)
 
+    merged_success_urls = merge_preserving_order(
+        existing_success_urls,
+        [item["effective_domain"] for item in succeeded],
+    )
+    merged_api_urls = merge_preserving_order(existing_api_urls, unique_api_domains)
+
     with open(SUCCESS_OUTPUT_FILE, "w") as f:
-        f.write(f"# Searchable YIFY/YTS Mirrors — {len(succeeded)} found\n")
-        for item in succeeded:
-            f.write(item["effective_domain"] + "\n")
+        f.write(f"# Searchable YIFY/YTS Mirrors — {len(merged_success_urls)} found\n")
+        for url in merged_success_urls:
+            f.write(url + "\n")
 
     with open(API_OUTPUT_FILE, "w") as f:
-        f.write(f"# YIFY/YTS JSON API Mirrors — {len(unique_api_domains)} found\n")
-        for api_domain in unique_api_domains:
+        f.write(f"# YIFY/YTS JSON API Mirrors — {len(merged_api_urls)} found\n")
+        for api_domain in merged_api_urls:
             f.write(api_domain + "\n")
 
     report = {
         "query": args.query,
         "source_cache": DOMAIN_CACHE_FILE,
-        "total_gathered": len(clean_domains),
+        "total_gathered": loaded_total,
+        "visited_this_run": len(results),
         "successful_count": len(succeeded),
         "failed_count": len(failed),
-        "api_successful_count": len(unique_api_domains),
+        "api_successful_count": len(merged_api_urls),
         "successful": succeeded,
         "api_successful": api_succeeded,
         "failed": failed,

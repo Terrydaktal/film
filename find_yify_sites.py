@@ -23,13 +23,8 @@ CHATBOT_SESSION_FILE = "/home/lewis/Dev/chatbot/.browser-session"
 DOMAIN_CACHE_FILE    = "/home/lewis/Dev/film/scraped_domains.json"
 GATHERED_OUTPUT_FILE = "/home/lewis/Dev/film/yify_all_gathered_links.txt"
 SEARCH_PROBE_QUERY   = "apex"
-
-# Queries and how many pages to scrape per query: (query, pages)
-SEARCH_PLAN = [
-    ("yify",            5),
-    ("yts",             5),
-    ("yify proxy list", 5),
-]
+SEARCH_PAGES_PER_QUERY = 5
+SEARCH_PLAN = []
 
 PROXY_LIST_CONCURRENCY = 8
 
@@ -84,39 +79,52 @@ def fetch_url_with_optional_doh(url, timeout=6.0):
     if not hostname or not scheme:
         return None
 
-    system_ok = False
-    try:
-        ORIGINAL_GETADDRINFO(hostname, port)
-        system_ok = True
-    except Exception:
-        pass
-
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 
-    if not system_ok:
-        ip = resolve_via_cloudflare(hostname)
-        if not ip:
-            return None
-
-        def patched_getaddrinfo(host, p, *args, **kwargs):
-            if host == hostname:
-                return [(2, 1, 6, "", (ip, p))]
-            return ORIGINAL_GETADDRINFO(host, p, *args, **kwargs)
-
-        with GETADDRINFO_PATCH_LOCK:
-            previous_getaddrinfo = _socket.getaddrinfo
-            _socket.getaddrinfo = patched_getaddrinfo
-            try:
-                return requests.get(url, timeout=timeout, headers=headers, verify=False, allow_redirects=True)
-            except Exception:
-                return None
-            finally:
-                _socket.getaddrinfo = previous_getaddrinfo
+    def is_dns_like_failure(exc):
+        text = str(exc).lower()
+        return any(
+            marker in text
+            for marker in (
+                "name or service not known",
+                "temporary failure in name resolution",
+                "failed to resolve",
+                "nodename nor servname provided",
+                "no address associated with hostname",
+                "dns",
+                "getaddrinfo",
+            )
+        )
 
     try:
         return requests.get(url, timeout=timeout, headers=headers, verify=False, allow_redirects=True)
-    except Exception:
+    except Exception as exc:
+        if not is_dns_like_failure(exc):
+            return None
+
+    ip = resolve_via_cloudflare(hostname)
+    if not ip:
         return None
+
+    def patched_getaddrinfo(host, p, *args, **kwargs):
+        if host == hostname:
+            return [(2, 1, 6, "", (ip, p))]
+        return ORIGINAL_GETADDRINFO(host, p, *args, **kwargs)
+
+    acquired = GETADDRINFO_PATCH_LOCK.acquire(timeout=max(1.0, timeout + 1.0))
+    if not acquired:
+        return None
+    try:
+        previous_getaddrinfo = _socket.getaddrinfo
+        _socket.getaddrinfo = patched_getaddrinfo
+        try:
+            return requests.get(url, timeout=timeout, headers=headers, verify=False, allow_redirects=True)
+        except Exception:
+            return None
+        finally:
+            _socket.getaddrinfo = previous_getaddrinfo
+    finally:
+        GETADDRINFO_PATCH_LOCK.release()
 
 def extract_search_candidates(base_url, html, query):
     candidates = []
@@ -633,6 +641,17 @@ async def revisit_cached_domains(browser, cached_domains):
 
 async def main():
     parser = argparse.ArgumentParser(description="YIFY mirror finder")
+    parser.add_argument(
+        "queries",
+        nargs="*",
+        help="Search terms to run through Yandex and DuckDuckGo fallback; each term is searched for five pages",
+    )
+    parser.add_argument(
+        "--search-engine",
+        choices=("yandex", "duckduckgo", "both"),
+        default="both",
+        help="Which discovery source to use for stage 1 gathering (default: both)",
+    )
     parser.add_argument("--recheck", action="store_true",
                         help="Skip scraping and re-verify domains from the cached scraped_domains.json")
     parser.add_argument("--visit-cached-domains", action="store_true",
@@ -641,8 +660,17 @@ async def main():
 
     print("[*] Initializing YIFY Site Finder...")
 
+    if not (args.recheck or args.visit_cached_domains):
+        if not args.queries:
+            parser.error("stage 1 now requires one or more search terms unless --recheck or --visit-cached-domains is used")
+        search_plan = [(query, SEARCH_PAGES_PER_QUERY) for query in args.queries]
+    else:
+        search_plan = []
+
     all_domains  = set()
     stage2_mirrors = set()
+    existing_all_domains = set()
+    existing_stage2_mirrors = set()
 
     if (args.recheck or args.visit_cached_domains) and os.path.exists(DOMAIN_CACHE_FILE):
         print(f"[*] --recheck mode: loading domains from {DOMAIN_CACHE_FILE}")
@@ -651,17 +679,44 @@ async def main():
         stage2_mirrors = set(cache.get("stage2_mirrors", []))
         print(f"[*] Loaded {len(all_domains)} domains ({len(stage2_mirrors)} stage-2 mirrors).")
     elif not args.visit_cached_domains:
-        print(f"[*] Search plan: {len(SEARCH_PLAN)} queries × up to 5 pages each = up to {sum(p for _,p in SEARCH_PLAN)} Yandex pages total.")
+        if os.path.exists(DOMAIN_CACHE_FILE):
+            try:
+                existing_cache = json.loads(open(DOMAIN_CACHE_FILE).read())
+                existing_all_domains = set(existing_cache.get("all_domains", []))
+                existing_stage2_mirrors = set(existing_cache.get("stage2_mirrors", []))
+                if existing_all_domains or existing_stage2_mirrors:
+                    print(
+                        f"[*] Loaded existing gathered cache with {len(existing_all_domains)} domains "
+                        f"and {len(existing_stage2_mirrors)} stage-2 mirrors for merge."
+                    )
+            except Exception as e:
+                print(f"[!] Failed to read existing gathered cache for merge: {e}")
+
+        global SEARCH_PLAN
+        SEARCH_PLAN = search_plan
+        use_yandex = args.search_engine in {"yandex", "both"}
+        use_duckduckgo = args.search_engine in {"duckduckgo", "both"}
+        print(
+            f"[*] Search plan: {len(SEARCH_PLAN)} queries × {SEARCH_PAGES_PER_QUERY} pages each = "
+            f"up to {sum(p for _, p in SEARCH_PLAN)} pages per enabled engine "
+            f"({args.search_engine})."
+        )
         ws_endpoint = None
-        if os.path.exists(CHATBOT_SESSION_FILE):
+        if use_yandex and os.path.exists(CHATBOT_SESSION_FILE):
             ws_endpoint = open(CHATBOT_SESSION_FILE).read().strip()
             print(f"[*] Found chatbot Chrome session: {ws_endpoint}")
-        else:
-            print(f"[!] No chatbot session at {CHATBOT_SESSION_FILE}. Will fall back to DuckDuckGo.")
+        elif use_yandex:
+            if use_duckduckgo:
+                print(f"[!] No chatbot session at {CHATBOT_SESSION_FILE}. Yandex scraping is unavailable, DuckDuckGo will still run.")
+            else:
+                print(f"[!] No chatbot session at {CHATBOT_SESSION_FILE}. Yandex scraping is unavailable in yandex-only mode.")
 
-        if async_playwright is None:
-            print("[!] Playwright is not installed. Skipping browser-based stage 1 scrape and falling back to DuckDuckGo.")
-        else:
+        if use_yandex and async_playwright is None:
+            if use_duckduckgo:
+                print("[!] Playwright is not installed. Skipping browser-based Yandex scrape; DuckDuckGo will still run.")
+            else:
+                print("[!] Playwright is not installed. Yandex scraping is unavailable in yandex-only mode.")
+        elif use_yandex:
             async with async_playwright() as p:
                 browser = None
                 if ws_endpoint:
@@ -675,19 +730,25 @@ async def main():
                     all_domains, stage2_mirrors = await run_search_plan(browser)
                     await browser.close()
 
-        if not all_domains:
-            stage2_mirrors = set()
-            print("[!] Yandex scrape returned nothing. Falling back to DuckDuckGo...")
-            fallback_queries = ["yify", "yts", "yify proxy", "yify mirror", "yts proxy", "yts mirror"]
-            for query in fallback_queries:
-                print(f"[FALLBACK] DuckDuckGo: '{query}'")
+        should_run_duckduckgo = use_duckduckgo
+        if should_run_duckduckgo:
+            if use_yandex and not all_domains:
+                stage2_mirrors = set()
+                print("[!] Yandex scrape returned nothing. Continuing with DuckDuckGo...")
+            else:
+                print("[*] Running DuckDuckGo stage 1 gathering...")
+            for query in args.queries:
+                print(f"[DUCKDUCKGO] '{query}'")
                 all_domains.update(scrape_duckduckgo_query(query))
+
+        all_domains.update(existing_all_domains)
+        stage2_mirrors.update(existing_stage2_mirrors)
 
         # Save raw scraped domains to cache for future --recheck runs
         cache = {"all_domains": list(all_domains), "stage2_mirrors": list(stage2_mirrors)}
         with open(DOMAIN_CACHE_FILE, "w") as f:
             json.dump(cache, f, indent=2)
-        print(f"[*] Scraped domain list cached to {DOMAIN_CACHE_FILE}")
+        print(f"[*] Scraped domain list merged and cached to {DOMAIN_CACHE_FILE}")
 
     if args.visit_cached_domains:
         if not os.path.exists(CHATBOT_SESSION_FILE):

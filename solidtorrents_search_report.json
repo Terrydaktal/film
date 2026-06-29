@@ -1,0 +1,23 @@
+{
+    "api_successful": [
+        {
+            "domain": "https://solidtorrents.to",
+            "effective_domain": "https://solidtorrents.to",
+            "reason": "Working API",
+            "detected_search_format": "JSON",
+            "sample_search_url": "https://solidtorrents.to/api/v1/search?q=house+of+the+dragon",
+            "query": "house of the dragon"
+        }
+    ],
+    "successful": [
+        {
+            "domain": "https://solidtorrents.to",
+            "effective_domain": "https://solidtorrents.to",
+            "reason": "Working HTML",
+            "detected_search_format": "HTML",
+            "sample_search_url": "https://solidtorrents.to/",
+            "query": "house of the dragon"
+        }
+    ],
+    "failed": []
+}

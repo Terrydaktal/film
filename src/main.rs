@@ -104,12 +104,79 @@ fn get_magnet_uri(url: &str) -> String {
     if let Some(h) = get_infohash(url) {
         // Construct a magnet URI with popular public trackers
         format!(
-            "magnet:?xt=urn:btih:{}&dn=Movie&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce&tr%3A%2F%2Ftracker.coppersurfer.tk%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969%2Fannounce",
+            "magnet:?xt=urn:btih:{}&dn=Movie&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce&tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969%2Fannounce",
             h
         )
     } else {
         url.to_string()
     }
+}
+
+fn torrent_source_for_launch(url: &str, local_torrent_path: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.starts_with("magnet:") {
+        return trimmed.to_string();
+    }
+    if get_infohash(trimmed).is_some() {
+        return get_magnet_uri(trimmed);
+    }
+    if std::path::Path::new(local_torrent_path).exists() {
+        return local_torrent_path.to_string();
+    }
+    trimmed.to_string()
+}
+
+fn launch_source_from_url_or_hash(url: &str, hash: &str, title: &str, local_torrent_path: &str) -> String {
+    let source = torrent_source_for_launch(url, local_torrent_path);
+    if !source.trim().is_empty() {
+        return source;
+    }
+    let clean_hash: String = hash
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_uppercase();
+    if clean_hash.len() == 40 {
+        make_magnet_link(&clean_hash, title)
+    } else {
+        source
+    }
+}
+
+fn launch_magnet_for_display(url: &str, hash: &str, title: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.starts_with("magnet:") {
+        return trimmed.to_string();
+    }
+    if let Some(info_hash) = get_infohash(trimmed) {
+        return make_magnet_link(&info_hash, title);
+    }
+    let clean_hash: String = hash
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_uppercase();
+    if clean_hash.len() == 40 {
+        make_magnet_link(&clean_hash, title)
+    } else {
+        String::new()
+    }
+}
+
+fn display_source_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        "(not stored; generated from info hash)".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn should_show_source_url(url: &str, launch_magnet: &str) -> bool {
+    let trimmed = url.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with("magnet:")
+        && trimmed != launch_magnet.trim()
 }
 
 // Helper to locate the largest media file inside a directory recursively
@@ -236,6 +303,98 @@ fn format_live_torrent_status(
 
 fn is_webtorrent_seeding_line(line: &str) -> bool {
     line.trim_start().starts_with("Seeding:")
+}
+
+fn spawn_webtorrent_output_reader<R>(
+    reader: R,
+    log_prefix: &'static str,
+    status_map: Arc<Mutex<TorrentStatusMap>>,
+    status_key: String,
+    progress_dir: PathBuf,
+    ctx: egui::Context,
+)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let reader = std::io::BufReader::new(reader);
+        for line_res in reader.lines().flatten() {
+            let line = line_res.trim_end().to_string();
+            if !line.trim().is_empty() {
+                println!("[{}] {}", log_prefix, line);
+            }
+
+            if is_webtorrent_seeding_line(&line) {
+                let mut map = status_map.lock().unwrap();
+                if let Some(s) = map.get_mut(&status_key) {
+                    s.active = false;
+                    s.speed = "Complete".to_string();
+                    s.peers.clear();
+                }
+                ctx.request_repaint();
+                break;
+            }
+
+            let line_lower = line.to_lowercase();
+            if line_lower.contains("error:") || line_lower.contains("unexpected error") {
+                let mut map = status_map.lock().unwrap();
+                if let Some(s) = map.get_mut(&status_key) {
+                    s.active = false;
+                    s.speed = "Error".to_string();
+                    s.peers = line.trim().to_string();
+                }
+                ctx.request_repaint();
+                continue;
+            }
+
+            if line_lower.contains("downloading to:") || line_lower.contains("server running at:") {
+                let mut map = status_map.lock().unwrap();
+                if let Some(s) = map.get_mut(&status_key) {
+                    if s.speed == "Connecting..." {
+                        s.speed = "Waiting for peers...".to_string();
+                    }
+                    if s.peers == "connecting" {
+                        s.peers.clear();
+                    }
+                }
+                ctx.request_repaint();
+            }
+
+            if line_lower.contains("fetching torrent metadata") {
+                let peer_text = line
+                    .split("from")
+                    .nth(1)
+                    .map(|part| part.trim().to_string())
+                    .unwrap_or_else(|| "0 peers".to_string());
+                let mut map = status_map.lock().unwrap();
+                if let Some(s) = map.get_mut(&status_key) {
+                    s.speed = "Fetching metadata".to_string();
+                    s.peers = peer_text;
+                }
+                ctx.request_repaint();
+                continue;
+            }
+
+            if let Some(update) = parse_webtorrent_line(&line) {
+                if let Some(ref downloaded) = update.downloaded {
+                    write_torrent_progress(&progress_dir, downloaded);
+                }
+                let mut map = status_map.lock().unwrap();
+                if let Some(s) = map.get_mut(&status_key) {
+                    if let Some(speed) = update.speed {
+                        s.speed = speed;
+                    }
+                    if let Some(downloaded) = update.downloaded {
+                        s.downloaded = downloaded;
+                    }
+                    if let Some(peers) = update.peers {
+                        s.peers = peers;
+                    }
+                }
+                ctx.request_repaint();
+            }
+        }
+    });
 }
 
 const MIN_LOCAL_PLAY_CONTIGUOUS_BYTES: u64 = 10 * 1024 * 1024;
@@ -1268,55 +1427,134 @@ struct MirrorSearchReport {
     failed: Vec<MirrorSearchReportEntry>,
 }
 
-fn load_search_mirrors() -> Vec<String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchSource {
+    Yify,
+    X1337,
+    SolidTorrents,
+    ExtTo,
+}
+
+impl SearchSource {
+    fn source_label(self) -> &'static str {
+        match self {
+            SearchSource::Yify => "YIFY",
+            SearchSource::X1337 => "1337x",
+            SearchSource::SolidTorrents => "SolidTorrents",
+            SearchSource::ExtTo => "ext",
+        }
+    }
+
+    fn search_button_label(self) -> &'static str {
+        match self {
+            SearchSource::Yify => "🔍 Search YIFY Database",
+            SearchSource::X1337 => "🔍 Search 1337x Database",
+            SearchSource::SolidTorrents => "🔍 Search SolidTorrents API",
+            SearchSource::ExtTo => "🔍 Search ext Mirrors",
+        }
+    }
+
+    fn heading(self) -> &'static str {
+        match self {
+            SearchSource::Yify => "🔍 Search YIFY / YTS Database",
+            SearchSource::X1337 => "🔍 Search 1337x Database",
+            SearchSource::SolidTorrents => "🔍 Search SolidTorrents API",
+            SearchSource::ExtTo => "🔍 Search ext Mirrors",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            SearchSource::Yify => "Search online for torrents across verified YIFY/YTS mirrors, or select a cached library on the left.",
+            SearchSource::X1337 => "Search online for torrents across verified 1337x mirrors, or select a cached library on the left.",
+            SearchSource::SolidTorrents => "Search online for torrents via SolidTorrents API, querying the global DHT network with no page blocks.",
+            SearchSource::ExtTo => "Search online for torrents across verified ext mirrors, or select a cached library on the left.",
+        }
+    }
+
+    fn api_mirror_file(self) -> Option<&'static str> {
+        match self {
+            SearchSource::Yify => Some("yify_api_mirrors.txt"),
+            SearchSource::X1337 => None,
+            SearchSource::SolidTorrents => Some("solidtorrents_api_mirrors.txt"),
+            SearchSource::ExtTo => Some("ext_api_mirrors.txt"),
+        }
+    }
+
+    fn html_mirror_file(self) -> &'static str {
+        match self {
+            SearchSource::Yify => "yify_mirrors.txt",
+            SearchSource::X1337 => "1337x_mirrors.txt",
+            SearchSource::SolidTorrents => "solidtorrents_mirrors.txt",
+            SearchSource::ExtTo => "ext_mirrors.txt",
+        }
+    }
+
+    fn report_file(self) -> &'static str {
+        match self {
+            SearchSource::Yify => "yify_search_report.json",
+            SearchSource::X1337 => "1337x_search_report.json",
+            SearchSource::SolidTorrents => "solidtorrents_search_report.json",
+            SearchSource::ExtTo => "ext_search_report.json",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppTab {
+    Library,
+    Search,
+}
+
+fn push_unique_mirror(mirrors: &mut Vec<String>, line: &str) {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return;
+    }
+    if !mirrors.iter().any(|existing| existing == line) {
+        mirrors.push(line.to_string());
+    }
+}
+
+fn load_search_mirrors(source: SearchSource) -> Vec<String> {
     let mut mirrors = Vec::new();
-    if let Ok(content) = fs::read_to_string("yify_api_mirrors.txt") {
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if !mirrors.iter().any(|existing| existing == line) {
-                mirrors.push(line.to_string());
+    if let Some(path) = source.api_mirror_file() {
+        if let Ok(content) = fs::read_to_string(path) {
+            for line in content.lines() {
+                push_unique_mirror(&mut mirrors, line);
             }
         }
     }
 
-    if let Ok(content) = fs::read_to_string("yify_mirrors.txt") {
+    if let Ok(content) = fs::read_to_string(source.html_mirror_file()) {
         for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if line.contains("yts") || line.contains("yify") {
-                let domain = line.to_string();
-                if !mirrors.contains(&domain) {
-                    mirrors.push(domain);
+            push_unique_mirror(&mut mirrors, line);
+        }
+    }
+    if mirrors.len() > 1 {
+        let mut other_mirrors = mirrors.split_off(1);
+        other_mirrors.sort_by_key(|m| !m.starts_with("https://"));
+        mirrors.extend(other_mirrors);
+    }
+    mirrors
+}
+
+fn load_diagnostic_recheck_mirrors(source: SearchSource) -> Vec<(String, MirrorStatusSource)> {
+    let mut mirrors = Vec::new();
+    if let Some(path) = source.api_mirror_file() {
+        if let Ok(content) = fs::read_to_string(path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if !mirrors.iter().any(|(existing, _)| existing == line) {
+                    mirrors.push((line.to_string(), MirrorStatusSource::LiveRecheckApi));
                 }
             }
         }
     }
-    // Prioritize HTTPS (excluding our hardcoded official API which is already first)
-    let mut other_mirrors = mirrors.split_off(1);
-    other_mirrors.sort_by_key(|m| !m.starts_with("https://"));
-    mirrors.extend(other_mirrors);
-    mirrors
-}
-
-fn load_diagnostic_recheck_mirrors() -> Vec<(String, MirrorStatusSource)> {
-    let mut mirrors = Vec::new();
-    if let Ok(content) = fs::read_to_string("yify_api_mirrors.txt") {
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if !mirrors.iter().any(|(existing, _)| existing == line) {
-                mirrors.push((line.to_string(), MirrorStatusSource::LiveRecheckApi));
-            }
-        }
-    }
-    if let Ok(content) = fs::read_to_string("yify_mirrors.txt") {
+    if let Ok(content) = fs::read_to_string(source.html_mirror_file()) {
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -1331,9 +1569,10 @@ fn load_diagnostic_recheck_mirrors() -> Vec<(String, MirrorStatusSource)> {
 }
 
 fn load_report_only_diagnostic_statuses(
+    source: SearchSource,
     rechecked_mirrors: &[(String, MirrorStatusSource)],
 ) -> Vec<MirrorStatus> {
-    let report_path = "yify_search_report.json";
+    let report_path = source.report_file();
     let content = match fs::read_to_string(report_path) {
         Ok(content) => content,
         Err(_) => return Vec::new(),
@@ -1667,6 +1906,569 @@ fn scrape_yts_html_fallback(agent: &ureq::Agent, mirror: &str, query: &str) -> V
     movies
 }
 
+fn strip_html_tags(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in text.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#039;", "'")
+        .replace("&nbsp;", " ")
+        .trim()
+        .to_string()
+}
+
+fn quality_from_title(title: &str) -> String {
+    let lower = title.to_lowercase();
+    if lower.contains("2160p") || lower.contains("4k") {
+        "2160p".to_string()
+    } else if lower.contains("1080p") {
+        "1080p".to_string()
+    } else if lower.contains("720p") {
+        "720p".to_string()
+    } else if lower.contains("480p") {
+        "480p".to_string()
+    } else {
+        "Unknown".to_string()
+    }
+}
+
+fn year_from_title(title: &str) -> Option<u16> {
+    for token in title.split(|c: char| !c.is_ascii_digit()) {
+        if token.len() == 4 {
+            if let Ok(year) = token.parse::<u16>() {
+                if (1900..=2100).contains(&year) {
+                    return Some(year);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_release_title(title: &str) -> String {
+    let mut out = strip_html_tags(title)
+        .replace('.', " ")
+        .replace('_', " ");
+    for marker in [" 2160p", " 1080p", " 720p", " 480p", " x264", " x265", " h264", " h265", " web-dl", " webrip", " bluray"] {
+        if let Some(pos) = out.to_lowercase().find(marker) {
+            out = out[..pos].trim().to_string();
+            break;
+        }
+    }
+    out.trim_matches(|c: char| c == '-' || c.is_whitespace())
+        .to_string()
+}
+
+fn query_matches_title(query: &str, title: &str) -> bool {
+    let title_lower = title.to_lowercase();
+    query.to_lowercase()
+        .split_whitespace()
+        .filter(|word| word.len() > 1)
+        .all(|word| title_lower.contains(word))
+}
+
+fn solidtorrents_size_string(value: &serde_json::Value) -> String {
+    if let Some(bytes) = value.as_u64() {
+        return format_size(bytes);
+    }
+    if let Some(size) = value.as_str() {
+        return size.to_string();
+    }
+    "Unknown".to_string()
+}
+
+fn scrape_solidtorrents_api(agent: &ureq::Agent, mirror: &str, query: &str) -> Vec<YtsMovie> {
+    let encoded = percent_encode(query);
+    let url = format!("{}/api/v1/search?q={}&limit=100", mirror.trim_end_matches('/'), encoded);
+    let res = agent
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .call();
+
+    let Ok(mut resp) = res else {
+        return Vec::new();
+    };
+    let Ok(body) = resp.body_mut().read_to_string() else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return Vec::new();
+    };
+    if value["success"] != true {
+        return Vec::new();
+    }
+
+    let mut movies = Vec::new();
+    if let Some(results) = value["results"].as_array() {
+        for item in results {
+            let title = item["title"].as_str().unwrap_or("").trim();
+            let info_hash = item["infohash"]
+                .as_str()
+                .or_else(|| item["infoHash"].as_str())
+                .unwrap_or("")
+                .trim();
+            let clean_hash: String = info_hash
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_uppercase();
+            if title.is_empty() || clean_hash.len() != 40 || !query_matches_title(query, title) {
+                continue;
+            }
+
+            let display_title = normalize_release_title(title);
+            let movie_title = if display_title.is_empty() {
+                title.to_string()
+            } else {
+                display_title
+            };
+            let year = year_from_title(title);
+            let seeds = item["seeders"]
+                .as_u64()
+                .or_else(|| item["seeds"].as_u64())
+                .map(|v| v as u32);
+            let peers = item["leechers"]
+                .as_u64()
+                .or_else(|| item["peers"].as_u64())
+                .map(|v| v as u32);
+            let size = solidtorrents_size_string(&item["size"]);
+
+            movies.push(YtsMovie {
+                title_long: Some(title.to_string()),
+                title: movie_title,
+                year,
+                rating: None,
+                genres: None,
+                runtime: None,
+                torrents: vec![YtsTorrent {
+                    url: make_magnet_link(&clean_hash, title),
+                    hash: clean_hash,
+                    quality: quality_from_title(title),
+                    size,
+                    seeds,
+                    peers,
+                    found_count: 1,
+                }],
+            });
+        }
+    }
+    movies
+}
+
+fn extract_first_href_with_markers(section: &str, markers: &[&str]) -> Option<String> {
+    for quote in ['"', '\''] {
+        let needle = format!("href={}", quote);
+        for fragment in section.split(&needle).skip(1) {
+            let end = fragment.find(quote)?;
+            let href = &fragment[..end];
+            if markers.iter().any(|marker| href.to_lowercase().contains(marker)) {
+                return Some(href.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_first_size_like_text(section: &str) -> Option<String> {
+    let text = strip_html_tags(section);
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    for idx in 0..tokens.len() {
+        let token = tokens[idx].trim_matches(|c: char| c == ',' || c == ')' || c == '(');
+        if matches!(token.to_ascii_uppercase().as_str(), "KB" | "MB" | "GB" | "TB") && idx > 0 {
+            let previous = tokens[idx - 1].trim_matches(|c: char| c == ',' || c == ')' || c == '(');
+            if previous.chars().any(|c| c.is_ascii_digit()) {
+                return Some(format!("{} {}", previous, token));
+            }
+        }
+        let upper = token.to_ascii_uppercase();
+        if upper.ends_with("KB") || upper.ends_with("MB") || upper.ends_with("GB") || upper.ends_with("TB") {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn extract_magnet_and_hash_from_html(html: &str) -> Option<(String, String)> {
+    let magnet_pos = html.find("magnet:?xt=urn:btih:")?;
+    let rest = &html[magnet_pos..];
+    let end = rest.find('"').or_else(|| rest.find('\'')).unwrap_or(rest.len());
+    let magnet = rest[..end].replace("&amp;", "&");
+    let hash_start = "magnet:?xt=urn:btih:".len();
+    if rest.len() <= hash_start {
+        return None;
+    }
+    let hash_rest = &rest[hash_start..];
+    let hash_end = hash_rest
+        .find('&')
+        .or_else(|| hash_rest.find('"'))
+        .or_else(|| hash_rest.find('\''))
+        .unwrap_or(hash_rest.len());
+    let clean_hash = hash_rest[..hash_end]
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_uppercase();
+    if clean_hash.len() == 40 {
+        Some((magnet, clean_hash))
+    } else {
+        None
+    }
+}
+
+fn scrape_ext_api(agent: &ureq::Agent, mirror: &str, query: &str) -> Vec<YtsMovie> {
+    let encoded = percent_encode(query);
+    let candidate_urls = [
+        format!("{}/api/v1/search?q={}&limit=100", mirror.trim_end_matches('/'), encoded),
+        format!("{}/api/search?q={}&limit=100", mirror.trim_end_matches('/'), encoded),
+        format!("{}/api/torrents/search?q={}&limit=100", mirror.trim_end_matches('/'), encoded),
+    ];
+
+    for url in candidate_urls {
+        let Ok(mut resp) = agent
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .call()
+        else {
+            continue;
+        };
+        let Ok(body) = resp.body_mut().read_to_string() else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+
+        let results = value["results"]
+            .as_array()
+            .or_else(|| value["items"].as_array())
+            .or_else(|| value["data"]["results"].as_array())
+            .or_else(|| value["data"]["items"].as_array());
+
+        let Some(results) = results else {
+            continue;
+        };
+
+        let mut movies = Vec::new();
+        for item in results {
+            let title = item["title"]
+                .as_str()
+                .or_else(|| item["name"].as_str())
+                .or_else(|| item["filename"].as_str())
+                .unwrap_or("")
+                .trim();
+            let info_hash = item["infohash"]
+                .as_str()
+                .or_else(|| item["infoHash"].as_str())
+                .or_else(|| item["hash"].as_str())
+                .unwrap_or("")
+                .trim();
+            let clean_hash: String = info_hash
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_uppercase();
+            if title.is_empty() || clean_hash.len() != 40 || !query_matches_title(query, title) {
+                continue;
+            }
+            let display_title = normalize_release_title(title);
+            let movie_title = if display_title.is_empty() {
+                title.to_string()
+            } else {
+                display_title
+            };
+            let seeds = item["seeders"]
+                .as_u64()
+                .or_else(|| item["seeds"].as_u64())
+                .map(|v| v as u32);
+            let peers = item["leechers"]
+                .as_u64()
+                .or_else(|| item["peers"].as_u64())
+                .map(|v| v as u32);
+            let size = solidtorrents_size_string(&item["size"]);
+
+            movies.push(YtsMovie {
+                title_long: Some(title.to_string()),
+                title: movie_title,
+                year: year_from_title(title),
+                rating: None,
+                genres: None,
+                runtime: None,
+                torrents: vec![YtsTorrent {
+                    url: make_magnet_link(&clean_hash, title),
+                    hash: clean_hash,
+                    quality: quality_from_title(title),
+                    size,
+                    seeds,
+                    peers,
+                    found_count: 1,
+                }],
+            });
+        }
+        if !movies.is_empty() {
+            return movies;
+        }
+    }
+
+    Vec::new()
+}
+
+fn scrape_ext_html_fallback(agent: &ureq::Agent, mirror: &str, query: &str) -> Vec<YtsMovie> {
+    let encoded = percent_encode(query);
+    let url = format!("{}/browse/?q={}&with_adult=1", mirror.trim_end_matches('/'), encoded);
+    let Ok(mut resp) = agent
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .call()
+    else {
+        return Vec::new();
+    };
+    let Ok(body) = resp.body_mut().read_to_string() else {
+        return Vec::new();
+    };
+    let body_lower = body.to_lowercase();
+    if body_lower.contains("cf-mitigated") || body_lower.contains("just a moment") {
+        return Vec::new();
+    }
+
+    let mut movies = Vec::new();
+    for row in body.split("<tr").skip(1) {
+        let detail_href = extract_first_href_with_markers(
+            row,
+            &["/torrent/", "/view/", "/download/", "/browse/", "/detail/"],
+        );
+        let Some(detail_href) = detail_href else {
+            continue;
+        };
+        let row_text = strip_html_tags(row);
+        if row_text.is_empty() || !query_matches_title(query, &row_text) {
+            continue;
+        }
+
+        let title = normalize_release_title(&row_text);
+        if title.is_empty() {
+            continue;
+        }
+
+        let detail_url = if detail_href.starts_with("http") {
+            detail_href.clone()
+        } else {
+            format!("{}{}", mirror.trim_end_matches('/'), detail_href)
+        };
+
+        let seeds = extract_table_number(row, "seed")
+            .or_else(|| extract_table_number(row, "seeds"))
+            .or_else(|| extract_table_number(row, "coll-2"));
+        let peers = extract_table_number(row, "leech")
+            .or_else(|| extract_table_number(row, "leechers"))
+            .or_else(|| extract_table_number(row, "coll-3"));
+        let size = extract_first_size_like_text(row).unwrap_or_else(|| "Unknown".to_string());
+
+        let mut magnet_and_hash = extract_magnet_and_hash_from_html(row);
+        if magnet_and_hash.is_none() {
+            if let Ok(mut detail_resp) = agent
+                .get(&detail_url)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                .call()
+            {
+                if let Ok(detail_body) = detail_resp.body_mut().read_to_string() {
+                    magnet_and_hash = extract_magnet_and_hash_from_html(&detail_body);
+                }
+            }
+        }
+
+        let Some((magnet, clean_hash)) = magnet_and_hash else {
+            continue;
+        };
+
+        movies.push(YtsMovie {
+            title_long: Some(row_text.clone()),
+            title,
+            year: year_from_title(&row_text),
+            rating: None,
+            genres: None,
+            runtime: None,
+            torrents: vec![YtsTorrent {
+                url: magnet,
+                hash: clean_hash,
+                quality: quality_from_title(&row_text),
+                size,
+                seeds,
+                peers,
+                found_count: 1,
+            }],
+        });
+    }
+    movies
+}
+
+fn scrape_1337x_html_fallback(agent: &ureq::Agent, mirror: &str, query: &str) -> Vec<YtsMovie> {
+    let encoded = percent_encode(query);
+    let url = format!("{}/search/{}/1/", mirror.trim_end_matches('/'), encoded);
+    let res = agent
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .call();
+
+    let Ok(mut resp) = res else {
+        return Vec::new();
+    };
+    let Ok(body) = resp.body_mut().read_to_string() else {
+        return Vec::new();
+    };
+
+    let mut movies = Vec::new();
+    for row in body.split("<tr").skip(1) {
+        if !row.contains("/torrent/") {
+            continue;
+        }
+
+        let Some(href_pos) = row.find("/torrent/") else {
+            continue;
+        };
+        let href_rest = &row[href_pos..];
+        let Some(href_end) = href_rest.find('"') else {
+            continue;
+        };
+        let detail_url = format!("{}{}", mirror.trim_end_matches('/'), &href_rest[..href_end]);
+
+        let title = if let Some(title_attr) = row.find("title=\"") {
+            let rest = &row[title_attr + 7..];
+            rest.find('"')
+                .map(|end| strip_html_tags(&rest[..end]))
+                .unwrap_or_default()
+        } else if let Some(anchor_start) = row[href_pos..].find('>') {
+            let rest = &row[href_pos + anchor_start + 1..];
+            rest.find('<')
+                .map(|end| strip_html_tags(&rest[..end]))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if title.is_empty() || !query_matches_title(query, &title) {
+            continue;
+        }
+
+        let seeds = extract_table_number(row, "coll-2");
+        let peers = extract_table_number(row, "coll-3");
+        let size = extract_size_from_row(row).unwrap_or_else(|| "Unknown".to_string());
+
+        let mut magnet = String::new();
+        let mut clean_hash = String::new();
+        if let Ok(mut detail_resp) = agent
+            .get(&detail_url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .call()
+        {
+            if let Ok(detail_body) = detail_resp.body_mut().read_to_string() {
+                if let Some(magnet_pos) = detail_body.find("magnet:?xt=urn:btih:") {
+                    let rest = &detail_body[magnet_pos..];
+                    if let Some(end) = rest.find('"') {
+                        magnet = rest[..end].replace("&amp;", "&");
+                    }
+                    let hash_start = "magnet:?xt=urn:btih:".len();
+                    if rest.len() > hash_start {
+                        let hash_rest = &rest[hash_start..];
+                        let hash_end = hash_rest.find('&').or_else(|| hash_rest.find('"')).unwrap_or(hash_rest.len());
+                        clean_hash = hash_rest[..hash_end]
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric())
+                            .collect::<String>()
+                            .to_uppercase();
+                    }
+                }
+            }
+        }
+        if magnet.is_empty() || clean_hash.len() != 40 {
+            continue;
+        }
+
+        let torrent = YtsTorrent {
+            url: magnet,
+            hash: clean_hash,
+            quality: quality_from_title(&title),
+            size,
+            seeds,
+            peers,
+            found_count: 1,
+        };
+        movies.push(YtsMovie {
+            title_long: Some(title.clone()),
+            title: normalize_release_title(&title),
+            year: year_from_title(&title),
+            rating: None,
+            genres: None,
+            runtime: None,
+            torrents: vec![torrent],
+        });
+    }
+    movies
+}
+
+fn extract_table_number(row: &str, class_name: &str) -> Option<u32> {
+    let needle = format!("class=\"{}\"", class_name);
+    let pos = row.find(&needle)?;
+    let rest = &row[pos..];
+    let start = rest.find('>')? + 1;
+    let end = rest[start..].find('<')?;
+    strip_html_tags(&rest[start..start + end]).trim().parse::<u32>().ok()
+}
+
+fn extract_size_from_row(row: &str) -> Option<String> {
+    let pos = row.find("coll-4").or_else(|| row.find("size"))?;
+    let rest = &row[pos..];
+    let start = rest.find('>')? + 1;
+    let end = rest[start..].find('<')?;
+    let text = strip_html_tags(&rest[start..start + end]);
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn merge_search_results(results: &mut Vec<YtsMovie>, new_movies: Vec<YtsMovie>) {
+    for movie in new_movies {
+        if let Some(existing_movie) = results
+            .iter_mut()
+            .find(|m| m.title == movie.title && m.year == movie.year)
+        {
+            for t in movie.torrents {
+                if let Some(existing_t) = existing_movie
+                    .torrents
+                    .iter_mut()
+                    .find(|ext_t| ext_t.hash.to_uppercase() == t.hash.to_uppercase())
+                {
+                    existing_t.found_count += 1;
+                    if existing_t.seeds.is_none() {
+                        existing_t.seeds = t.seeds;
+                    }
+                    if existing_t.peers.is_none() {
+                        existing_t.peers = t.peers;
+                    }
+                } else {
+                    let mut new_t = t.clone();
+                    new_t.found_count = 1;
+                    existing_movie.torrents.push(new_t);
+                }
+            }
+        } else {
+            let mut new_movie = movie.clone();
+            for t in &mut new_movie.torrents {
+                t.found_count = 1;
+            }
+            results.push(new_movie);
+        }
+    }
+}
+
 fn make_magnet_link(info_hash: &str, title: &str) -> String {
     let trackers = [
         "udp://open.demonii.com:1337/announce",
@@ -1910,30 +2712,68 @@ fn format_subtitle_summary(langs: &[String]) -> String {
     }
 }
 
-fn check_single_mirror_status(agent: &ureq::Agent, mirror: &str) -> MirrorStatus {
+fn check_single_mirror_status(agent: &ureq::Agent, mirror: &str, search_source: SearchSource) -> MirrorStatus {
     let encoded = percent_encode("Apex");
-    let url_json = format!("{}/api/v2/list_movies.json?query_term={}&limit=1", mirror, encoded);
-    let res_json = agent.get(&url_json).call();
-    
-    match res_json {
-        Ok(mut resp) => {
+    if search_source != SearchSource::X1337 {
+        let url_json = match search_source {
+            SearchSource::Yify => format!(
+                "{}/api/v2/list_movies.json?query_term={}&limit=1",
+                mirror.trim_end_matches('/'),
+                encoded
+            ),
+            SearchSource::SolidTorrents => format!(
+                "{}/api/v1/search?q={}&limit=1",
+                mirror.trim_end_matches('/'),
+                encoded
+            ),
+            SearchSource::ExtTo => format!(
+                "{}/api/v1/search?q={}&limit=1",
+                mirror.trim_end_matches('/'),
+                encoded
+            ),
+            SearchSource::X1337 => String::new(),
+        };
+        let res_json = agent.get(&url_json).call();
+
+        if let Ok(mut resp) = res_json {
             if let Ok(body) = resp.body_mut().read_to_string() {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
-                    if val["status"] == "ok" && val["data"]["movies"].as_array().is_some() {
+                    let api_ok = match search_source {
+                        SearchSource::Yify => val["status"] == "ok" && val["data"]["movies"].as_array().is_some(),
+                        SearchSource::SolidTorrents => val["success"] == true,
+                        SearchSource::ExtTo => {
+                            val["success"] == true
+                                || val["results"].as_array().is_some()
+                                || val["items"].as_array().is_some()
+                                || val["data"]["results"].as_array().is_some()
+                        }
+                        SearchSource::X1337 => false,
+                    };
+                    if api_ok {
+                        let detail = match search_source {
+                            SearchSource::Yify => "Responds to list_movies API requests",
+                            SearchSource::SolidTorrents => "Responds to SolidTorrents search API requests",
+                            SearchSource::ExtTo => "Responds to ext search API requests",
+                            SearchSource::X1337 => "Responds to API requests",
+                        };
                         return MirrorStatus {
                             url: mirror.to_string(),
                             status: "Working (API)".to_string(),
-                            detail: "Responds to list_movies API requests".to_string(),
-                            source: MirrorStatusSource::LiveRecheckHtml,
+                            detail: detail.to_string(),
+                            source: MirrorStatusSource::LiveRecheckApi,
                         };
                     }
                 }
             }
         }
-        Err(_) => {}
     }
 
-    let url_html = format!("{}/?keyword={}", mirror, encoded);
+    let url_html = match search_source {
+        SearchSource::Yify => format!("{}/?keyword={}", mirror.trim_end_matches('/'), encoded),
+        SearchSource::X1337 => format!("{}/search/{}/1/", mirror.trim_end_matches('/'), encoded),
+        SearchSource::SolidTorrents => format!("{}/search?q={}", mirror.trim_end_matches('/'), encoded),
+        SearchSource::ExtTo => format!("{}/browse/?q={}&with_adult=1", mirror.trim_end_matches('/'), encoded),
+    };
     let res_html = agent.get(&url_html).call();
 
     match res_html {
@@ -1993,7 +2833,25 @@ fn check_single_mirror_status(agent: &ureq::Agent, mirror: &str) -> MirrorStatus
                     || body.contains("yts.rs")
                     || body.contains("yify subtitles");
 
-                if has_search_results || has_yts_shell {
+                let has_1337x_shell = body_lower.contains("/torrent/")
+                    || body_lower.contains("search torrents")
+                    || body_lower.contains("1337x");
+                let has_solidtorrents_shell = body_lower.contains("solidtorrents")
+                    || body_lower.contains("/api/v1/search")
+                    || body_lower.contains("search torrents");
+                let has_ext_shell = body_lower.contains("extratorrent")
+                    || body_lower.contains("ext.to")
+                    || body_lower.contains("/browse/?q=")
+                    || body_lower.contains("with_adult=1");
+
+                let search_ui_works = match search_source {
+                    SearchSource::Yify => has_search_results || has_yts_shell,
+                    SearchSource::X1337 => has_1337x_shell,
+                    SearchSource::SolidTorrents => has_solidtorrents_shell,
+                    SearchSource::ExtTo => has_ext_shell,
+                };
+
+                if search_ui_works {
                     return MirrorStatus {
                         url: mirror.to_string(),
                         status: "Working (HTML)".to_string(),
@@ -2005,7 +2863,7 @@ fn check_single_mirror_status(agent: &ureq::Agent, mirror: &str) -> MirrorStatus
                 return MirrorStatus {
                     url: mirror.to_string(),
                     status: "Broken/Empty".to_string(),
-                    detail: "Loads but doesn't contain YTS elements".to_string(),
+                    detail: format!("Loads but doesn't contain {} search elements", search_source.source_label()),
                     source: MirrorStatusSource::LiveRecheckHtml,
                 };
             }
@@ -2046,6 +2904,7 @@ fn check_single_mirror_status(agent: &ureq::Agent, mirror: &str) -> MirrorStatus
 }
 
 fn run_mirror_diagnostics(
+    search_source: SearchSource,
     mirrors: Vec<(String, MirrorStatusSource)>,
     cached_report_statuses: Vec<MirrorStatus>,
     statuses: Arc<Mutex<Vec<MirrorStatus>>>,
@@ -2076,6 +2935,7 @@ fn run_mirror_diagnostics(
         let is_checking_clone = is_checking.clone();
         let completed_clone = completed_count.clone();
         let ctx_clone = ctx.clone();
+        let search_source = search_source;
 
         thread::spawn(move || {
             let config = ureq::Agent::config_builder()
@@ -2083,7 +2943,7 @@ fn run_mirror_diagnostics(
                 .build();
             let agent: ureq::Agent = config.into();
 
-            let res = check_single_mirror_status(&agent, &m);
+            let res = check_single_mirror_status(&agent, &m, search_source);
 
             {
                 let mut list = statuses_clone.lock().unwrap();
@@ -2189,9 +3049,11 @@ struct MirrorStatus {
 }
 
 struct AppState {
+    active_tab: AppTab,
     movies: Vec<MovieGroup>,
     selected_idx: Option<usize>,
     new_movie_url: String,
+    library_filter: String,
     status_message: String,
 
     torrent_status: Arc<Mutex<TorrentStatusMap>>,
@@ -2202,10 +3064,14 @@ struct AppState {
     is_searching: Arc<Mutex<bool>>,
     search_status: Arc<Mutex<String>>,
     search_cancelled: Arc<Mutex<bool>>,
+    search_source: SearchSource,
 
     show_mirror_checker: bool,
+    mirror_checker_source: SearchSource,
     mirror_statuses: Arc<Mutex<Vec<MirrorStatus>>>,
     is_checking_mirrors: Arc<Mutex<bool>>,
+    pending_delete_file: Option<(PathBuf, PathBuf)>,
+    pending_delete_dir: Option<PathBuf>,
 }
 
 impl AppState {
@@ -2225,9 +3091,11 @@ impl AppState {
         });
 
         Self {
+            active_tab: AppTab::Library,
             movies,
             selected_idx,
             new_movie_url: String::new(),
+            library_filter: String::new(),
             status_message: "Ready".to_string(),
             torrent_status,
             spawned_children,
@@ -2236,9 +3104,13 @@ impl AppState {
             is_searching: Arc::new(Mutex::new(false)),
             search_status: Arc::new(Mutex::new(String::new())),
             search_cancelled: Arc::new(Mutex::new(false)),
+            search_source: SearchSource::Yify,
             show_mirror_checker: false,
+            mirror_checker_source: SearchSource::Yify,
             mirror_statuses: Arc::new(Mutex::new(Vec::new())),
             is_checking_mirrors: Arc::new(Mutex::new(false)),
+            pending_delete_file: None,
+            pending_delete_dir: None,
         }
     }
 
@@ -2283,15 +3155,97 @@ impl eframe::App for AppState {
         style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(60, 60, 70);
         ctx.set_style(style);
 
+        if let Some((cache_path, media_path)) = self.pending_delete_file.clone() {
+            egui::Window::new("Confirm Delete File")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("Delete this local media file from disk?");
+                    ui.label(egui::RichText::new(media_path.display().to_string()).weak());
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.pending_delete_file = None;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new("Delete File")
+                                    .fill(egui::Color32::from_rgb(180, 40, 40)),
+                            )
+                            .clicked()
+                        {
+                            delete_local_media_file(&cache_path, &media_path);
+                            self.pending_delete_file = None;
+                            self.refresh();
+                            self.status_message = "Deleted local media file.".to_string();
+                        }
+                    });
+                });
+        }
+
+        if let Some(dir_path) = self.pending_delete_dir.clone() {
+            egui::Window::new("Confirm Delete Film")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("Delete this film library item and its cached files?");
+                    ui.label(egui::RichText::new(dir_path.display().to_string()).weak());
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.pending_delete_dir = None;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new("Delete Film")
+                                    .fill(egui::Color32::from_rgb(180, 40, 40)),
+                            )
+                            .clicked()
+                        {
+                            {
+                                let mut children = self.spawned_children.lock().unwrap();
+                                for child in children.iter_mut() {
+                                    let _ = child.kill();
+                                }
+                                children.clear();
+                            }
+                            let _ = Command::new("pkill")
+                                .args(&["-9", "-i", "-f", "webtorrent"])
+                                .status();
+                            self.torrent_status.lock().unwrap().clear();
+                            if dir_path.exists() {
+                                let _ = fs::remove_dir_all(&dir_path);
+                            }
+                            self.pending_delete_dir = None;
+                            self.selected_idx = None;
+                            self.refresh();
+                            self.status_message = "Deleted film library item.".to_string();
+                        }
+                    });
+                });
+        }
+
         // Header Panel
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(8.0);
-                ui.heading(
-                    egui::RichText::new("🎬 Film Torrent Streaming Manager")
-                        .font(egui::FontId::proportional(22.0))
-                        .strong(),
-                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+	                    if ui.selectable_label(self.active_tab == AppTab::Library, "📂 Library").clicked() {
+	                        self.active_tab = AppTab::Library;
+	                        if self.selected_idx.is_none() && !self.movies.is_empty() {
+	                            self.selected_idx = Some(0);
+	                        }
+	                        self.show_mirror_checker = false;
+	                    }
+                        if ui.selectable_label(self.active_tab == AppTab::Search, "🔍 Search").clicked() {
+                            self.active_tab = AppTab::Search;
+                            self.selected_idx = None;
+                            self.show_mirror_checker = false;
+                            self.status_message = "Opened search dashboard".to_string();
+                        }
+	                });
                 ui.add_space(8.0);
             });
         });
@@ -2299,89 +3253,90 @@ impl eframe::App for AppState {
         // Bottom Status / Controller Panel
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Torrent / Magnet URL:").strong());
-                let _text_edit = ui.add(
-                    egui::TextEdit::singleline(&mut self.new_movie_url)
-                        .hint_text("Paste magnet link OR torrent download URL...")
-                        .desired_width(400.0)
-                );
-
-                if ui.button("➕ Add Torrent").clicked() {
-                    let url = self.new_movie_url.trim().to_string();
-                    if !url.is_empty() {
-                        let hash = get_infohash(&url).unwrap_or_else(|| {
-                            let cleaned: String = url.chars()
-                                .map(|c| if c.is_alphanumeric() { c } else { '_' })
-                                .collect();
-                            if cleaned.len() > 30 { cleaned[cleaned.len()-30..].to_string() } else { cleaned }
-                        });
-                        let dir_name = format!("torrent_{}", hash);
-                        let dest_dir = get_cache_dir().join(&dir_name);
-                        let _ = fs::create_dir_all(&dest_dir);
-
-                        let magnet_uri = get_magnet_uri(&url);
-
-                        let meta_path = dest_dir.join("metadata.json");
-                        let (film_title, year, source_label) =
-                            cache_movie_identity(&dest_dir, None);
-                        let display_title = match year {
-                            Some(year) => format!("{film_title} ({year})"),
-                            None => film_title.clone(),
-                        };
-                        let meta_json = serde_json::json!({
-                            "title": display_title,
-                            "url": magnet_uri,
-                            "film_title": film_title,
-                            "year": year,
-                            "source_label": source_label,
-                            "seeds": null,
-                            "peers": null,
-                        });
-                        if let Ok(content) = serde_json::to_string_pretty(&meta_json) {
-                            let _ = fs::write(&meta_path, content);
-                        }
-
-                        self.refresh();
-
-                        if let Some(pos) = self.movies.iter().position(|m| m.key == dir_name) {
-                            self.selected_idx = Some(pos);
-                        }
-
-                        self.new_movie_url.clear();
-                        self.status_message = format!("Added torrent to Cache Library. Click 'Start Torrent' to download!");
-                    } else {
-                        self.status_message = "Error: Torrent URL cannot be empty!".to_string();
-                    }
-                }
-
-                if ui.button("🔄 Refresh Cache").clicked() {
-                    self.refresh();
-                    refresh_cached_seeds_and_peers(get_cache_dir(), ctx.clone());
-                    self.status_message = "Cache refreshed; updating seeds and leechers in background...".to_string();
-                }
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Status:").weak());
-                ui.label(egui::RichText::new(&self.status_message).italics().color(egui::Color32::from_rgb(100, 200, 255)));
-                ui.separator();
-                let map = self.torrent_status.lock().unwrap();
-                let active_entries: Vec<_> = map.values().filter(|s| s.active).collect();
-                let any_active = !active_entries.is_empty();
-                if any_active {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "⬇ {} active torrent{} — {}",
-                            active_entries.len(),
-                            if active_entries.len() == 1 { "" } else { "s" },
-                            active_entries.iter().map(|s| s.speed.as_str()).collect::<Vec<_>>().join(" + ")
-                        ))
-                        .color(egui::Color32::from_rgb(0, 220, 100))
-                        .strong(),
+            if self.active_tab == AppTab::Search {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Torrent / Magnet URL:").strong());
+                    let _text_edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.new_movie_url)
+                            .hint_text("Paste magnet link OR torrent download URL...")
+                            .desired_width(400.0)
                     );
-                    drop(map);
-                    if ui
+
+                    if ui.button("➕ Add Torrent").clicked() {
+                        let url = self.new_movie_url.trim().to_string();
+                        if !url.is_empty() {
+                            let hash = get_infohash(&url).unwrap_or_else(|| {
+                                let cleaned: String = url.chars()
+                                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                                    .collect();
+                                if cleaned.len() > 30 { cleaned[cleaned.len()-30..].to_string() } else { cleaned }
+                            });
+                            let dir_name = format!("torrent_{}", hash);
+                            let dest_dir = get_cache_dir().join(&dir_name);
+                            let _ = fs::create_dir_all(&dest_dir);
+
+                            let magnet_uri = get_magnet_uri(&url);
+
+                            let meta_path = dest_dir.join("metadata.json");
+                            let (film_title, year, source_label) =
+                                cache_movie_identity(&dest_dir, None);
+                            let display_title = match year {
+                                Some(year) => format!("{film_title} ({year})"),
+                                None => film_title.clone(),
+                            };
+                            let meta_json = serde_json::json!({
+                                "title": display_title,
+                                "url": magnet_uri,
+                                "film_title": film_title,
+                                "year": year,
+                                "source_label": source_label,
+                                "seeds": null,
+                                "peers": null,
+                            });
+                            if let Ok(content) = serde_json::to_string_pretty(&meta_json) {
+                                let _ = fs::write(&meta_path, content);
+                            }
+
+                            self.refresh();
+
+                            if let Some(pos) = self.movies.iter().position(|m| m.key == dir_name) {
+                                self.selected_idx = Some(pos);
+                            }
+
+                            self.new_movie_url.clear();
+                            self.status_message = "Added torrent to Cache Library. Click 'Start Torrent' to download!".to_string();
+                        } else {
+                            self.status_message = "Error: Torrent URL cannot be empty!".to_string();
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+            }
+            ui.horizontal(|ui| {
+	                ui.label(egui::RichText::new("Status:").weak());
+	                ui.label(egui::RichText::new(&self.status_message).italics().color(egui::Color32::from_rgb(100, 200, 255)));
+	                ui.separator();
+                    let active_summary = {
+                        let map = self.torrent_status.lock().unwrap();
+                        let active_entries: Vec<_> = map.values().filter(|s| s.active).collect();
+                        if active_entries.is_empty() {
+                            None
+                        } else {
+                            Some(format!(
+                                "⬇ {} active torrent{} — {}",
+                                active_entries.len(),
+                                if active_entries.len() == 1 { "" } else { "s" },
+                                active_entries.iter().map(|s| s.speed.as_str()).collect::<Vec<_>>().join(" + ")
+                            ))
+                        }
+                    };
+	                if let Some(active_summary) = active_summary {
+	                    ui.label(
+	                        egui::RichText::new(active_summary)
+	                        .color(egui::Color32::from_rgb(0, 220, 100))
+	                        .strong(),
+	                    );
+	                    if ui
                         .add(
                             egui::Button::new(
                                 egui::RichText::new("⏹ Stop All Torrents")
@@ -2406,31 +3361,37 @@ impl eframe::App for AppState {
                         for s in map.values_mut() {
                             s.active = false;
                         }
-                        self.status_message = "All torrents stopped.".to_string();
-                    }
-                }
-            });
+	                        self.status_message = "All torrents stopped.".to_string();
+	                    }
+	                }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("🔄 Refresh").clicked() {
+                            self.refresh();
+                            refresh_cached_seeds_and_peers(get_cache_dir(), ctx.clone());
+                            self.status_message = "Cache refreshed; updating seeds and leechers in background...".to_string();
+                        }
+                    });
+	            });
             ui.add_space(8.0);
         });
 
         // Left Sidebar: Movie Selection List
-        egui::SidePanel::left("left_panel")
-            .resizable(true)
-            .default_width(260.0)
-            .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.heading("📂 Cache Libraries");
-                ui.add_space(8.0);
+        if self.active_tab == AppTab::Library {
+	            egui::SidePanel::left("left_panel")
+	                .resizable(true)
+	                .default_width(260.0)
+	                .show(ctx, |ui| {
+	                ui.add_space(8.0);
+	                ui.heading("📂 Library");
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.library_filter)
+                            .hint_text("Search library...")
+                            .desired_width(f32::INFINITY),
+                    );
+	                ui.add_space(8.0);
 
-                if ui.button("🔍 Search YIFY Database").clicked() {
-                    self.selected_idx = None;
-                    self.status_message = "Opened movie search dashboard".to_string();
-                }
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
+	                egui::ScrollArea::vertical().show(ui, |ui| {
                     if self.movies.is_empty() {
                         ui.label(
                             egui::RichText::new(
@@ -2440,12 +3401,34 @@ impl eframe::App for AppState {
                             .italics(),
                         );
                     } else {
-        for (idx, group) in self.movies.iter().enumerate() {
-                            let is_selected = self.selected_idx == Some(idx);
-                            let title = match group.year {
-                                Some(year) => format!("{} ({year})", group.title),
-                                None => group.title.clone(),
-                            };
+                        let filter = self.library_filter.trim().to_lowercase();
+	        for (idx, group) in self.movies.iter().enumerate() {
+	                            let is_selected = self.selected_idx == Some(idx);
+	                            let title = match group.year {
+	                                Some(year) => format!("{} ({year})", group.title),
+	                                None => group.title.clone(),
+	                            };
+                            if !filter.is_empty() {
+                                let matches_title = title.to_lowercase().contains(&filter);
+                                let matches_torrent = group.torrents.iter().any(|torrent| {
+                                    torrent.dir_name.to_lowercase().contains(&filter)
+                                        || torrent.source_label.to_lowercase().contains(&filter)
+                                        || torrent.metadata.as_ref().is_some_and(|meta| {
+                                            meta.title.to_lowercase().contains(&filter)
+                                                || meta.url.to_lowercase().contains(&filter)
+                                                || meta.torrent_options.as_ref().is_some_and(|options| {
+                                                    options.iter().any(|opt| {
+                                                        opt.quality.to_lowercase().contains(&filter)
+                                                            || opt.hash.to_lowercase().contains(&filter)
+                                                            || opt.url.to_lowercase().contains(&filter)
+                                                    })
+                                                })
+                                        })
+                                });
+                                if !matches_title && !matches_torrent {
+                                    continue;
+                                }
+                            }
 
                              // Check if any torrent in this group is actively downloading
                              let is_downloading = {
@@ -2543,21 +3526,24 @@ impl eframe::App for AppState {
                                  if ui
                                      .selectable_label(is_selected, egui::RichText::new(item_text))
                                      .clicked()
-                                 {
-                                     self.selected_idx = Some(idx);
-                                     self.status_message = format!("Selected: {}", title);
-                                 }
-                             });
-                             ui.add_space(4.0);
-                        }
-                    }
-                });
-            });
+	                                 {
+	                                     self.selected_idx = Some(idx);
+	                                     self.active_tab = AppTab::Library;
+	                                     self.status_message = format!("Selected: {}", title);
+	                                 }
+		                             });
+		                             ui.add_space(4.0);
+	                        }
+	                    }
+	                });
+	            });
+        }
 
         // Central Panel
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(8.0);
-            if let Some(idx) = self.selected_idx {
+            if self.active_tab == AppTab::Library {
+                if let Some(idx) = self.selected_idx {
                 if idx < self.movies.len() {
                     let group = self.movies[idx].clone();
                     egui::ScrollArea::vertical()
@@ -2566,11 +3552,12 @@ impl eframe::App for AppState {
                             self.central_panel_rendering(ui, ctx, group);
                         });
                 }
+                }
             } else {
                 ui.vertical(|ui| {
                     if self.show_mirror_checker {
                         ui.horizontal(|ui| {
-                            ui.heading(egui::RichText::new("🌐 Mirror Status Checker").font(egui::FontId::proportional(20.0)).strong());
+                            ui.heading(egui::RichText::new(format!("🌐 {} Mirror Status Checker", self.mirror_checker_source.source_label())).font(egui::FontId::proportional(20.0)).strong());
                             if ui.button("🔙 Back to Search").clicked() {
                                 self.show_mirror_checker = false;
                             }
@@ -2582,9 +3569,9 @@ impl eframe::App for AppState {
                         if !*self.is_checking_mirrors.lock().unwrap()
                             && self.mirror_statuses.lock().unwrap().is_empty()
                         {
-                            let rechecked_mirrors = load_diagnostic_recheck_mirrors();
+                            let rechecked_mirrors = load_diagnostic_recheck_mirrors(self.mirror_checker_source);
                             *self.mirror_statuses.lock().unwrap() =
-                                load_report_only_diagnostic_statuses(&rechecked_mirrors);
+                                load_report_only_diagnostic_statuses(self.mirror_checker_source, &rechecked_mirrors);
                         }
 
                         let is_checking = *self.is_checking_mirrors.lock().unwrap();
@@ -2598,16 +3585,18 @@ impl eframe::App for AppState {
                             });
                         } else {
                             if ui.button("🔄 Run Diagnostics").clicked() {
-                                let mirrors = load_diagnostic_recheck_mirrors();
+                                let source = self.mirror_checker_source;
+                                let mirrors = load_diagnostic_recheck_mirrors(source);
                                 let cached_report_statuses =
-                                    load_report_only_diagnostic_statuses(&mirrors);
+                                    load_report_only_diagnostic_statuses(source, &mirrors);
                                 let statuses_clone = self.mirror_statuses.clone();
                                 let is_checking_clone = self.is_checking_mirrors.clone();
                                 let ctx_clone = ctx.clone();
                                 thread::spawn(move || {
-                                    run_mirror_diagnostics(
-                                        mirrors,
-                                        cached_report_statuses,
+	                                    run_mirror_diagnostics(
+                                            source,
+	                                        mirrors,
+	                                        cached_report_statuses,
                                         statuses_clone,
                                         is_checking_clone,
                                         ctx_clone,
@@ -2620,10 +3609,13 @@ impl eframe::App for AppState {
                         ui.separator();
                         ui.add_space(8.0);
 
-                        let list = self.mirror_statuses.lock().unwrap().clone();
-                        if list.is_empty() {
-                            ui.label(egui::RichText::new("No diagnostic report loaded yet. Run verify_yify_search.py, then reopen this view or click 'Run Diagnostics'.").italics().weak());
-                        } else {
+	                        let list = self.mirror_statuses.lock().unwrap().clone();
+	                        if list.is_empty() {
+	                            ui.label(egui::RichText::new(format!(
+                                    "No diagnostic report loaded yet. Run the verifier for {}, then reopen this view or click 'Run Diagnostics'.",
+                                    self.mirror_checker_source.source_label()
+                                )).italics().weak());
+	                        } else {
                             let mut report_api = Vec::new();
                             let mut report_searchable = Vec::new();
                             let mut report_failed = Vec::new();
@@ -2809,12 +3801,29 @@ impl eframe::App for AppState {
                         }
                     } else {
                         // Normal Search View!
-                        ui.heading(egui::RichText::new("🔍 Search YIFY / YTS Database").font(egui::FontId::proportional(20.0)).strong());
-                        ui.add_space(8.0);
-                        ui.label("Search online for torrents across verified mirrors, or select a cached library on the left.");
-                        ui.add_space(8.0);
+	                        ui.heading(egui::RichText::new(self.search_source.heading()).font(egui::FontId::proportional(20.0)).strong());
+	                        ui.add_space(8.0);
+	                        ui.label(self.search_source.description());
+	                        ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                for source in [SearchSource::Yify, SearchSource::X1337, SearchSource::SolidTorrents, SearchSource::ExtTo] {
+                                    let selected = self.search_source == source;
+                                    if ui.selectable_label(selected, source.source_label()).clicked() {
+                                        if self.search_source != source {
+                                            self.search_results.lock().unwrap().clear();
+                                            self.search_status.lock().unwrap().clear();
+                                        }
+                                        self.search_source = source;
+                                        self.mirror_checker_source = source;
+                                        self.show_mirror_checker = false;
+                                        self.mirror_statuses.lock().unwrap().clear();
+                                        self.status_message = format!("Opened {} search dashboard", source.source_label());
+                                    }
+                                }
+                            });
+                            ui.add_space(8.0);
 
-                        ui.horizontal(|ui| {
+	                        ui.horizontal(|ui| {
                             let search_input = ui.add(
                                 egui::TextEdit::singleline(&mut self.search_query)
                                     .hint_text("Type movie title (e.g. Inception)...")
@@ -2835,10 +3844,11 @@ impl eframe::App for AppState {
                                     *self.search_status.lock().unwrap() = "Search stopped by user.".to_string();
                                 }
                             } else {
-                                if ui.button("🔍 Search Database").clicked() || enter_pressed {
-                                    let query = self.search_query.trim().to_string();
-                                    if !query.is_empty() {
-                                        let results_clone = self.search_results.clone();
+	                                if ui.button(self.search_source.search_button_label()).clicked() || enter_pressed {
+	                                    let query = self.search_query.trim().to_string();
+	                                    if !query.is_empty() {
+                                            let search_source = self.search_source;
+	                                        let results_clone = self.search_results.clone();
                                         let is_searching_clone = self.is_searching.clone();
                                         let status_clone = self.search_status.clone();
                                         let search_cancelled_clone = self.search_cancelled.clone();
@@ -2846,13 +3856,18 @@ impl eframe::App for AppState {
  
                                         *self.is_searching.lock().unwrap() = true;
                                         *self.search_cancelled.lock().unwrap() = false;
-                                        *self.search_status.lock().unwrap() = "Stage 1: Searching JSON APIs...".to_string();
+	                                        *self.search_status.lock().unwrap() = match search_source {
+                                                SearchSource::Yify => "Stage 1: Searching YIFY JSON APIs...".to_string(),
+                                                SearchSource::X1337 => "Searching 1337x HTML mirrors...".to_string(),
+                                                SearchSource::SolidTorrents => "Searching SolidTorrents APIs...".to_string(),
+                                                SearchSource::ExtTo => "Searching ext mirrors...".to_string(),
+                                            };
                                         results_clone.lock().unwrap().clear();
                                         
                                         thread::spawn(move || {
-                                            let mirrors = load_search_mirrors();
-                                            if mirrors.is_empty() {
-                                                *status_clone.lock().unwrap() = "Error: yify_mirrors.txt not found!".to_string();
+	                                            let mirrors = load_search_mirrors(search_source);
+	                                            if mirrors.is_empty() {
+	                                                *status_clone.lock().unwrap() = format!("Error: {} mirror list not found!", search_source.source_label());
                                                 *is_searching_clone.lock().unwrap() = false;
                                                 ctx_clone.request_repaint();
                                                 return;
@@ -2873,10 +3888,11 @@ impl eframe::App for AppState {
                                                 let ctx_clone = ctx_clone.clone();
                                                 let active_threads = active_threads.clone();
                                                 let html_mirrors_to_query = html_mirrors_to_query.clone();
-                                                let search_cancelled_clone = search_cancelled_clone.clone();
-                                                let mirror = mirror.clone();
- 
-                                                thread::spawn(move || {
+	                                                let search_cancelled_clone = search_cancelled_clone.clone();
+	                                                let mirror = mirror.clone();
+                                                    let search_source = search_source;
+	 
+	                                                thread::spawn(move || {
                                                     if *search_cancelled_clone.lock().unwrap() {
                                                         let mut active = active_threads.lock().unwrap();
                                                         *active -= 1;
@@ -2888,57 +3904,58 @@ impl eframe::App for AppState {
                                                         .build();
                                                     let agent: ureq::Agent = config.into();
  
-                                                    let encoded = percent_encode(&query);
-                                                    let url = format!("{}/api/v2/list_movies.json?query_term={}&limit=10", mirror, encoded);
- 
-                                                    let res = agent.get(&url)
-                                                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                                                        .call();
-                                                    let mut parsed_movies = Vec::new();
-                                                    let mut is_json_success = false;
- 
-                                                    if let Ok(mut resp) = res {
-                                                        if let Ok(body) = resp.body_mut().read_to_string() {
-                                                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
-                                                                if val["status"] == "ok" {
-                                                                    if let Some(movies_arr) = val["data"]["movies"].as_array() {
-                                                                        for m_val in movies_arr {
-                                                                            if let Ok(movie) = serde_json::from_value::<YtsMovie>(m_val.clone()) {
-                                                                                parsed_movies.push(movie);
+	                                                    let mut parsed_movies = Vec::new();
+	                                                    let mut is_json_success = false;
+
+                                                    match search_source {
+                                                        SearchSource::Yify => {
+                                                            let encoded = percent_encode(&query);
+                                                            let url = format!("{}/api/v2/list_movies.json?query_term={}&limit=10", mirror.trim_end_matches('/'), encoded);
+                                                            let res = agent.get(&url)
+                                                                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                                                                .call();
+
+                                                            if let Ok(mut resp) = res {
+                                                                if let Ok(body) = resp.body_mut().read_to_string() {
+                                                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
+                                                                        if val["status"] == "ok" {
+                                                                            if let Some(movies_arr) = val["data"]["movies"].as_array() {
+                                                                                for m_val in movies_arr {
+                                                                                    if let Ok(movie) = serde_json::from_value::<YtsMovie>(m_val.clone()) {
+                                                                                        parsed_movies.push(movie);
+                                                                                    }
+                                                                                }
+                                                                                is_json_success = true;
                                                                             }
                                                                         }
-                                                                        is_json_success = true;
                                                                     }
                                                                 }
                                                             }
                                                         }
+                                                        SearchSource::SolidTorrents => {
+                                                            parsed_movies = scrape_solidtorrents_api(&agent, &mirror, &query);
+                                                            is_json_success = true;
+                                                        }
+                                                        SearchSource::ExtTo => {
+                                                            parsed_movies = scrape_ext_api(&agent, &mirror, &query);
+                                                            is_json_success = !parsed_movies.is_empty();
+                                                        }
+                                                        SearchSource::X1337 => {
+                                                            html_mirrors_to_query.lock().unwrap().push(mirror);
+                                                            let mut active = active_threads.lock().unwrap();
+                                                            *active -= 1;
+                                                            ctx_clone.request_repaint();
+                                                            return;
+                                                        }
                                                     }
  
-                                                    if is_json_success {
-                                                        if !parsed_movies.is_empty() && !*search_cancelled_clone.lock().unwrap() {
-                                                            let mut results = results_clone.lock().unwrap();
-                                                            for movie in parsed_movies {
-                                                                if let Some(existing_movie) = results.iter_mut().find(|m| m.title == movie.title && m.year == movie.year) {
-                                                                    for t in movie.torrents {
-                                                                        if let Some(existing_t) = existing_movie.torrents.iter_mut().find(|ext_t| ext_t.hash.to_uppercase() == t.hash.to_uppercase()) {
-                                                                            existing_t.found_count += 1;
-                                                                        } else {
-                                                                            let mut new_t = t.clone();
-                                                                            new_t.found_count = 1;
-                                                                            existing_movie.torrents.push(new_t);
-                                                                        }
-                                                                    }
-                                                                } else {
-                                                                    let mut new_movie = movie.clone();
-                                                                    for t in &mut new_movie.torrents {
-                                                                        t.found_count = 1;
-                                                                    }
-                                                                    results.push(new_movie);
-                                                                }
-                                                            }
-                                                            let total_torrents: usize = results.iter().map(|m| m.torrents.len()).sum();
-                                                            let mut status = status_clone.lock().unwrap();
-                                                            *status = format!("Stage 1: Updating JSON results (found {} torrent options)...", total_torrents);
+	                                                    if is_json_success {
+	                                                        if !parsed_movies.is_empty() && !*search_cancelled_clone.lock().unwrap() {
+	                                                            let mut results = results_clone.lock().unwrap();
+                                                                merge_search_results(&mut results, parsed_movies);
+	                                                            let total_torrents: usize = results.iter().map(|m| m.torrents.len()).sum();
+	                                                            let mut status = status_clone.lock().unwrap();
+	                                                            *status = format!("Stage 1: Updating JSON results (found {} torrent options)...", total_torrents);
                                                             ctx_clone.request_repaint();
                                                         }
                                                     } else {
@@ -2992,10 +4009,11 @@ impl eframe::App for AppState {
                                                     let status_clone = status_clone.clone();
                                                     let ctx_clone = ctx_clone.clone();
                                                     let active_html_threads = active_html_threads.clone();
-                                                    let search_cancelled_clone = search_cancelled_clone.clone();
-                                                    let mirror = mirror.clone();
- 
-                                                    thread::spawn(move || {
+	                                                let search_cancelled_clone = search_cancelled_clone.clone();
+	                                                let mirror = mirror.clone();
+                                                    let search_source = search_source;
+	 
+	                                                thread::spawn(move || {
                                                         if *search_cancelled_clone.lock().unwrap() {
                                                             let mut active = active_html_threads.lock().unwrap();
                                                             *active -= 1;
@@ -3007,32 +4025,19 @@ impl eframe::App for AppState {
                                                             .build();
                                                         let agent: ureq::Agent = config.into();
  
-                                                        let parsed_movies = scrape_yts_html_fallback(&agent, &mirror, &query);
+	                                                        let parsed_movies = match search_source {
+                                                                SearchSource::Yify => scrape_yts_html_fallback(&agent, &mirror, &query),
+                                                                SearchSource::X1337 => scrape_1337x_html_fallback(&agent, &mirror, &query),
+                                                                SearchSource::SolidTorrents => scrape_solidtorrents_api(&agent, &mirror, &query),
+                                                                SearchSource::ExtTo => scrape_ext_html_fallback(&agent, &mirror, &query),
+                                                            };
  
-                                                        if !parsed_movies.is_empty() && !*search_cancelled_clone.lock().unwrap() {
-                                                            let mut results = results_clone.lock().unwrap();
-                                                            for movie in parsed_movies {
-                                                                if let Some(existing_movie) = results.iter_mut().find(|m| m.title == movie.title && m.year == movie.year) {
-                                                                    for t in movie.torrents {
-                                                                        if let Some(existing_t) = existing_movie.torrents.iter_mut().find(|ext_t| ext_t.hash.to_uppercase() == t.hash.to_uppercase()) {
-                                                                            existing_t.found_count += 1;
-                                                                        } else {
-                                                                            let mut new_t = t.clone();
-                                                                            new_t.found_count = 1;
-                                                                            existing_movie.torrents.push(new_t);
-                                                                        }
-                                                                    }
-                                                                } else {
-                                                                    let mut new_movie = movie.clone();
-                                                                    for t in &mut new_movie.torrents {
-                                                                        t.found_count = 1;
-                                                                    }
-                                                                    results.push(new_movie);
-                                                                }
-                                                            }
-                                                            let total_torrents: usize = results.iter().map(|m| m.torrents.len()).sum();
-                                                            let mut status = status_clone.lock().unwrap();
-                                                            *status = format!("Stage 2: Updating HTML results (found {} torrent options)...", total_torrents);
+	                                                        if !parsed_movies.is_empty() && !*search_cancelled_clone.lock().unwrap() {
+	                                                            let mut results = results_clone.lock().unwrap();
+                                                                merge_search_results(&mut results, parsed_movies);
+	                                                            let total_torrents: usize = results.iter().map(|m| m.torrents.len()).sum();
+	                                                            let mut status = status_clone.lock().unwrap();
+	                                                            *status = format!("Stage 2: Updating HTML results (found {} torrent options)...", total_torrents);
                                                             ctx_clone.request_repaint();
                                                         }
  
@@ -3114,9 +4119,10 @@ impl eframe::App for AppState {
                                                 ui.separator();
 
                                                 let add_btn = ui.button(egui::RichText::new("➕ Add Film").strong());
-                                                if add_btn.clicked() {
-                                                    if let Some(first_torrent) = movie.torrents.first() {
-                                                        let first_hash = first_torrent.hash.to_uppercase();
+	                                                if add_btn.clicked() {
+	                                                    if let Some(first_torrent) = movie.torrents.first() {
+                                                            let source_label = self.search_source.source_label().to_string();
+	                                                        let first_hash = first_torrent.hash.to_uppercase();
                                                         let incoming_hashes: Vec<String> = movie
                                                             .torrents
                                                             .iter()
@@ -3138,20 +4144,20 @@ impl eframe::App for AppState {
                                                         };
 
                                                         let t_opts: Vec<TorrentOption> = movie.torrents.iter().map(|t| TorrentOption {
-                                                            quality: t.quality.clone(),
-                                                            size: t.size.clone(),
-                                                            hash: t.hash.to_uppercase(),
-                                                            url: make_magnet_link(&t.hash, &movie.title),
-                                                            seeds: t.seeds,
-                                                            peers: t.peers,
-                                                        }).collect();
+	                                                            quality: t.quality.clone(),
+	                                                            size: t.size.clone(),
+	                                                            hash: t.hash.to_uppercase(),
+	                                                            url: if t.url.is_empty() { make_magnet_link(&t.hash, &movie.title) } else { t.url.clone() },
+	                                                            seeds: t.seeds,
+	                                                            peers: t.peers,
+	                                                        }).collect();
 
                                                         let mut meta_json = MovieMetadata {
                                                             title: display_title,
-                                                            url: make_magnet_link(&first_torrent.hash, &movie.title),
-                                                            film_title: Some(movie.title.clone()),
-                                                            year: movie.year,
-                                                            source_label: Some("YIFY".to_string()),
+	                                                            url: if first_torrent.url.is_empty() { make_magnet_link(&first_torrent.hash, &movie.title) } else { first_torrent.url.clone() },
+	                                                            film_title: Some(movie.title.clone()),
+	                                                            year: movie.year,
+	                                                            source_label: Some(source_label),
                                                             duration: None,
                                                             seeds: Some(0),
                                                             peers: Some(0),
@@ -3184,13 +4190,17 @@ impl eframe::App for AppState {
                                                             let _ = fs::write(&metadata_path, content);
                                                         }
 
-                                                        self.refresh();
-
-                                                        if let Some(pos) = self.movies.iter().position(|m| m.key == film_key) {
-                                                            self.selected_idx = Some(pos);
-                                                        }
-
-                                                        self.status_message = format!("Added {} to Cache Library. Select qualities in sidebar to start downloading!", movie.title);
+	                                                        self.refresh();
+	
+	                                                        if let Some(pos) = self.movies.iter().position(|m| {
+                                                                m.key == film_key
+                                                                    || m.torrents.iter().any(|t| t.dir_name == dir_name)
+                                                            }) {
+	                                                            self.selected_idx = Some(pos);
+	                                                        }
+                                                            self.active_tab = AppTab::Library;
+	
+	                                                        self.status_message = format!("Added {} to Cache Library. Select qualities in sidebar to start downloading!", movie.title);
                                                     } else {
                                                         self.status_message = "Error: No stream options found for this film.".to_string();
                                                     }
@@ -3257,9 +4267,20 @@ impl PanelRenderHelper for AppState {
                 .strong(),
         );
         ui.add_space(8.0);
+        let primary_torrent = group
+            .torrents
+            .iter()
+            .find(|torrent| {
+                torrent
+                    .metadata
+                    .as_ref()
+                    .and_then(|meta| meta.torrent_options.as_ref())
+                    .is_some_and(|options| !options.is_empty())
+            })
+            .or_else(|| group.torrents.first());
  
         // Quality Option Buttons at the top (from metadata.torrent_options)
-        if let Some(torrent) = group.torrents.first() {
+        if let Some(torrent) = primary_torrent {
             let parent_cache_path = get_cache_dir().join(&torrent.dir_name);
             let root_media = find_media_file(&parent_cache_path);
             let root_has_torrent = parent_cache_path.join("movie.torrent").exists();
@@ -3268,8 +4289,13 @@ impl PanelRenderHelper for AppState {
                 map.get(&torrent.dir_name).map(|s| s.active).unwrap_or(false)
             };
             let root_hash = torrent.dir_name.strip_prefix("torrent_").map(|hash| hash.to_uppercase());
+            let has_torrent_options = torrent
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.torrent_options.as_ref())
+                .is_some_and(|options| !options.is_empty());
             let root_has_local_status = root_has_torrent || root_media.is_some() || root_is_active;
-            if root_has_local_status {
+            if root_has_local_status && !has_torrent_options {
                 ui.label(egui::RichText::new("Quality Options Local Status:").strong());
                 ui.add_space(6.0);
                 ui.group(|ui| {
@@ -3291,12 +4317,26 @@ impl PanelRenderHelper for AppState {
                         ui.label(egui::RichText::new(label).strong());
                         ui.add_space(4.0);
 
-                        if let Some(ref hash) = root_hash {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("Info Hash:").strong());
-                                ui.label(hash);
-                            });
-                        }
+	                        if let Some(ref hash) = root_hash {
+	                            ui.horizontal(|ui| {
+	                                ui.label(egui::RichText::new("Info Hash:").strong());
+	                                ui.label(hash);
+	                            });
+	                                let source_url = torrent.metadata.as_ref().map(|m| m.url.clone()).unwrap_or_default();
+	                                let display_magnet = launch_magnet_for_display(&source_url, hash, &title);
+                                if should_show_source_url(&source_url, &display_magnet) {
+	                                ui.horizontal_wrapped(|ui| {
+	                                    ui.label(egui::RichText::new("Source URL:").strong());
+	                                    ui.monospace(display_source_url(&source_url));
+	                                });
+                                }
+	                                if !display_magnet.is_empty() {
+	                                    ui.horizontal_wrapped(|ui| {
+	                                        ui.label(egui::RichText::new("Launch Magnet:").strong());
+                                        ui.monospace(&display_magnet);
+                                    });
+                                }
+	                        }
 
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Subfolder Path:").strong());
@@ -3441,7 +4481,12 @@ impl PanelRenderHelper for AppState {
                                     .fill(egui::Color32::from_rgb(0, 160, 80)),
                                 );
                                 if start_btn.clicked() {
-                                    let url_to_play = torrent.metadata.as_ref().map(|m| m.url.clone()).unwrap_or_default();
+	                                    let url_to_play = torrent.metadata.as_ref().map(|m| m.url.clone()).unwrap_or_default();
+                                        let root_hash_for_launch = torrent
+                                            .dir_name
+                                            .strip_prefix("torrent_")
+                                            .unwrap_or_default()
+                                            .to_string();
                                     let dir_to_play = torrent.dir_name.clone();
                                     let children_clone = self.spawned_children.clone();
                                     let torrent_status_clone = self.torrent_status.clone();
@@ -3449,33 +4494,26 @@ impl PanelRenderHelper for AppState {
                                     thread::spawn(move || {
                                         let mut children = children_clone.lock().unwrap();
 
-                                        let dest = format!("./stream_cache/{}", dir_to_play);
-                                        let dest_dir = PathBuf::from(&dest);
-                                        let local_torrent_path = format!("./stream_cache/{}/movie.torrent", dir_to_play);
-                                        let mut torrent_source = url_to_play.clone();
+	                                        let dest = format!("./stream_cache/{}", dir_to_play);
+	                                        let dest_dir = PathBuf::from(&dest);
+	                                        let local_torrent_path = format!("./stream_cache/{}/movie.torrent", dir_to_play);
+	                                        let torrent_source = launch_source_from_url_or_hash(
+                                                &url_to_play,
+                                                &root_hash_for_launch,
+                                                "Movie",
+                                                &local_torrent_path,
+                                            );
+	
+	                                        let _ = fs::create_dir_all(&dest_dir);
 
-                                        let _ = fs::create_dir_all(&dest_dir);
-
-                                        if std::path::Path::new(&local_torrent_path).exists() {
-                                            torrent_source = local_torrent_path;
-                                        } else if let Some(h) = get_infohash(&url_to_play) {
-                                            let torrent_url = format!("https://itorrents.net/torrent/{}.torrent", h);
-                                            let download_res = Command::new("curl")
-                                                .args(&["-s", "-L", "-o", &local_torrent_path, &torrent_url])
-                                                .status();
-                                            if download_res.is_ok() && std::path::Path::new(&local_torrent_path).exists() {
-                                                torrent_source = local_torrent_path;
-                                            }
-                                        }
-
-                                        {
-                                            let mut map = torrent_status_clone.lock().unwrap();
-                                            map.insert(dir_to_play.clone(), PerTorrentStatus {
-                                                active: true,
-                                                speed: "Connecting...".to_string(),
-                                                downloaded: "0 MB".to_string(),
-                                                peers: String::new(),
-                                            });
+	                                        {
+	                                            let mut map = torrent_status_clone.lock().unwrap();
+	                                            map.insert(dir_to_play.clone(), PerTorrentStatus {
+	                                                active: true,
+	                                                speed: "Connecting...".to_string(),
+	                                                downloaded: "0 MB".to_string(),
+	                                                peers: "connecting".to_string(),
+	                                            });
                                         }
                                         ctx_clone.request_repaint();
 
@@ -3501,64 +4539,31 @@ impl PanelRenderHelper for AppState {
                                         cmd.stdout(std::process::Stdio::piped());
                                         cmd.stderr(std::process::Stdio::piped());
 
-                                        let spawn_res = cmd.spawn();
-                                        if let Ok(mut child) = spawn_res {
-                                            let _child_pid = child.id();
-                                            if let Some(stderr) = child.stderr.take() {
-                                                let err_reader = std::io::BufReader::new(stderr);
-                                                thread::spawn(move || {
-                                                    for line_res in err_reader.lines().flatten() {
-                                                        if !line_res.trim().is_empty() {
-                                                            println!("[WEBTORRENT ERR] {}", line_res);
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                            if let Some(stdout) = child.stdout.take() {
-                                                let reader = std::io::BufReader::new(stdout);
-                                                let status_clone_2 = torrent_status_clone.clone();
-                                                let ctx_clone_2 = ctx_clone.clone();
-                                                let progress_dir = dest_dir.clone();
-                                                let progress_dir_name = dir_to_play.clone();
-                                                thread::spawn(move || {
-                                                    let mut buffer = String::new();
-                                                    let mut br = std::io::BufReader::new(reader);
-                                                    while let Ok(bytes) = br.read_line(&mut buffer) {
-                                                        if bytes == 0 {
-                                                            break;
-                                                        }
-                                                        if is_webtorrent_seeding_line(&buffer) {
-                                                            let mut map = status_clone_2.lock().unwrap();
-                                                            if let Some(s) = map.get_mut(&progress_dir_name) {
-                                                                s.active = false;
-                                                            }
-                                                            ctx_clone_2.request_repaint();
-                                                            break;
-                                                        }
-                                                        if let Some(update) = parse_webtorrent_line(&buffer) {
-                                                            if let Some(ref downloaded) = update.downloaded {
-                                                                write_torrent_progress(&progress_dir, downloaded);
-                                                            }
-                                                            let mut map = status_clone_2.lock().unwrap();
-                                                            if let Some(s) = map.get_mut(&progress_dir_name) {
-                                                                if let Some(speed) = update.speed {
-                                                                    s.speed = speed;
-                                                                }
-                                                                if let Some(downloaded) = update.downloaded {
-                                                                    s.downloaded = downloaded;
-                                                                }
-                                                                if let Some(peers) = update.peers {
-                                                                    s.peers = peers;
-                                                                }
-                                                            }
-                                                            ctx_clone_2.request_repaint();
-                                                        }
-                                                        buffer.clear();
-                                                    }
-                                                });
-                                            }
-                                            children.push(child);
-                                        }
+	                                        let spawn_res = cmd.spawn();
+	                                        if let Ok(mut child) = spawn_res {
+	                                            let _child_pid = child.id();
+	                                            if let Some(stderr) = child.stderr.take() {
+	                                                spawn_webtorrent_output_reader(
+	                                                    stderr,
+	                                                    "WEBTORRENT ERR",
+	                                                    torrent_status_clone.clone(),
+	                                                    dir_to_play.clone(),
+	                                                    dest_dir.clone(),
+	                                                    ctx_clone.clone(),
+	                                                );
+	                                            }
+	                                            if let Some(stdout) = child.stdout.take() {
+	                                                spawn_webtorrent_output_reader(
+	                                                    stdout,
+	                                                    "WEBTORRENT",
+	                                                    torrent_status_clone.clone(),
+	                                                    dir_to_play.clone(),
+	                                                    dest_dir.clone(),
+	                                                    ctx_clone.clone(),
+	                                                );
+	                                            }
+	                                            children.push(child);
+	                                        }
                                     });
                                     self.status_message = "Starting torrent download...".to_string();
                                 }
@@ -3600,60 +4605,168 @@ impl PanelRenderHelper for AppState {
                                     [150.0, 40.0],
                                     egui::Button::new("🗑 Delete File")
                                         .fill(egui::Color32::from_rgb(145, 70, 35)),
-                                );
-                                if delete_file_btn.clicked() {
-                                    delete_local_media_file(&parent_cache_path, &media_path);
-                                    self.refresh();
-                                }
-                            }
+	                                );
+	                                if delete_file_btn.clicked() {
+	                                    self.pending_delete_file = Some((parent_cache_path.clone(), media_path.clone()));
+	                                }
+	                            }
                         });
                     });
                 });
                 ui.add_space(8.0);
             }
 
-            if let Some(ref meta) = torrent.metadata {
-                if let Some(ref options) = meta.torrent_options {
-                    ui.label(egui::RichText::new("Choose Stream Quality Option:").strong());
-                    ui.add_space(4.0);
-                    for opt in options {
-                        if root_has_local_status
-                            && root_hash.as_deref() == Some(opt.hash.to_uppercase().as_str())
-                        {
-                            continue;
-                        }
-                        let quality_path = parent_cache_path.join(&opt.quality);
-                        let local_media = find_media_file(&quality_path);
-                        let hash = opt.hash.to_uppercase();
-                        
-                        let is_active = {
-                            let map = self.torrent_status.lock().unwrap();
-                            map.get(&hash).map(|s| s.active).unwrap_or(false)
-                        };
- 
-                        ui.group(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(format!("Stream Option: {}", opt.quality)).strong());
+		            if let Some(ref meta) = torrent.metadata {
+		                if let Some(ref options) = meta.torrent_options {
+                        if !options.is_empty() {
+		                    ui.label(egui::RichText::new("Torrent Options:").strong());
+		                    ui.add_space(4.0);
+
+                            let mut ordered_options: Vec<&TorrentOption> = options.iter().collect();
+                            ordered_options.sort_by_key(|opt| {
+                                let quality_path = parent_cache_path.join(&opt.quality);
+                                let local_media = find_media_file(&quality_path);
+                                let has_torrent = quality_path.join("movie.torrent").exists();
+                                let hash = opt.hash.to_uppercase();
+                                let is_active = {
+                                    let map = self.torrent_status.lock().unwrap();
+                                    map.get(&hash).map(|s| s.active).unwrap_or(false)
+                                };
+                                (!is_active, !(has_torrent || local_media.is_some()), opt.quality.clone())
+                            });
+
+		                    for opt in ordered_options {
+		                        let quality_path = parent_cache_path.join(&opt.quality);
+		                        let local_media = find_media_file(&quality_path);
+                                let has_torrent = quality_path.join("movie.torrent").exists();
+		                        let hash = opt.hash.to_uppercase();
+		                        
+		                        let is_active = {
+		                            let map = self.torrent_status.lock().unwrap();
+		                            map.get(&hash).map(|s| s.active).unwrap_or(false)
+		                        };
+		 
+		                        ui.group(|ui| {
+	                            ui.vertical(|ui| {
+	                                ui.label(egui::RichText::new(format!("Stream Option: {}", opt.quality)).strong());
                                 ui.add_space(4.0);
  
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("Info Hash:").strong());
-                                    ui.label(&opt.hash);
-                                });
- 
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("Total File Size:").strong());
+	                                ui.horizontal(|ui| {
+	                                    ui.label(egui::RichText::new("Info Hash:").strong());
+	                                    ui.label(&opt.hash);
+	                                });
+
+                                let display_magnet = launch_magnet_for_display(&opt.url, &opt.hash, &title);
+                                if should_show_source_url(&opt.url, &display_magnet) {
+                                    ui.horizontal_wrapped(|ui| {
+	                                        ui.label(egui::RichText::new("Source URL:").strong());
+	                                        ui.monospace(display_source_url(&opt.url));
+                                    });
+                                }
+
+	                                if !display_magnet.is_empty() {
+	                                    ui.horizontal_wrapped(|ui| {
+	                                        ui.label(egui::RichText::new("Launch Magnet:").strong());
+                                        ui.monospace(&display_magnet);
+                                    });
+                                }
+	 
+	                                ui.horizontal(|ui| {
+	                                    ui.label(egui::RichText::new("Total File Size:").strong());
                                     ui.label(&opt.size);
                                 });
  
-                                if let (Some(s), Some(l)) = (opt.seeds, opt.peers) {
-                                    ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new("Seeds / Leechers:").strong());
-                                        ui.label(format!("{} seeds · {} leechers", s, l));
-                                    });
-                                }
- 
-                                ui.add_space(8.0);
+	                                if let (Some(s), Some(l)) = (opt.seeds, opt.peers) {
+	                                    ui.horizontal(|ui| {
+	                                        ui.label(egui::RichText::new("Seeds / Leechers:").strong());
+	                                        ui.label(format!("{} seeds · {} leechers", s, l));
+	                                    });
+	                                }
+
+                                    if has_torrent || local_media.is_some() || is_active {
+		                                ui.horizontal(|ui| {
+		                                    ui.label(egui::RichText::new("Subfolder Path:").strong());
+                                            ui.label(format!("./stream_cache/{}/{}", torrent.dir_name, opt.quality));
+                                        });
+
+                                        let disk_space = get_folder_disk_space(&quality_path);
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("Disk Space Used:").strong());
+                                            ui.label(format_size(disk_space));
+                                        });
+
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("Subtitles:").strong());
+                                            let cached_langs = cached_subtitle_languages(&quality_path);
+                                            if !cached_langs.is_empty() {
+                                                let summary = format_subtitle_summary(&cached_langs);
+                                                ui.label(
+                                                    egui::RichText::new(format!("Available (cached): {}", summary))
+                                                        .color(egui::Color32::from_rgb(0, 200, 100))
+                                                        .strong(),
+                                                );
+                                            } else {
+                                                match torrent_subtitle_languages(&quality_path) {
+                                                    Some(langs) if !langs.is_empty() => {
+                                                        let summary = format_subtitle_summary(&langs);
+                                                        ui.label(
+                                                            egui::RichText::new(format!("In torrent: {}", summary))
+                                                                .color(egui::Color32::from_rgb(200, 160, 0))
+                                                                .strong(),
+                                                        );
+                                                    }
+                                                    Some(_) => {
+                                                        ui.label(egui::RichText::new("None in torrent").weak());
+                                                    }
+                                                    None => {
+                                                        ui.label(egui::RichText::new("Unknown (start torrent to check)").weak());
+                                                    }
+                                                }
+                                            }
+                                        });
+
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("Torrented Status:").strong());
+                                            let per_status = {
+                                                let map = self.torrent_status.lock().unwrap();
+                                                map.get(&hash).cloned()
+                                            };
+
+                                            if let Some(ref s) = per_status {
+                                                if s.active {
+                                                    ui.label(
+                                                        egui::RichText::new(format_live_torrent_status(
+                                                            &s.downloaded,
+                                                            &opt.size,
+                                                            &s.speed,
+                                                            &s.peers,
+                                                        ))
+                                                        .color(egui::Color32::from_rgb(0, 220, 100))
+                                                        .strong(),
+                                                    );
+                                                } else if let Some((dl, total)) = get_torrent_downloaded_and_total(&quality_path) {
+                                                    let pct = if total > 0 { (dl as f64 / total as f64) * 100.0 } else { 0.0 };
+                                                    ui.label(format!("{} / {} ({:.2}%)", format_size(dl), format_size(total), pct));
+                                                } else {
+                                                    ui.label(format!("0 B / {} (0.00%)", opt.size));
+                                                }
+                                            } else if let Some((dl, total)) = get_torrent_downloaded_and_total(&quality_path) {
+                                                let pct = if total > 0 { (dl as f64 / total as f64) * 100.0 } else { 0.0 };
+                                                ui.label(format!("{} / {} ({:.2}%)", format_size(dl), format_size(total), pct));
+                                            } else {
+                                                ui.label(format!("0 B / {} (0.00%)", opt.size));
+                                            }
+                                        });
+
+                                        if let Some(ref path) = local_media {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.label(egui::RichText::new("Largest Media File:").strong());
+                                                ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                                            });
+                                        }
+                                    }
+	 
+	                                ui.add_space(8.0);
  
                                 ui.horizontal(|ui| {
                                     if is_active {
@@ -3697,8 +4810,9 @@ impl PanelRenderHelper for AppState {
                                             .fill(egui::Color32::from_rgb(0, 160, 80)),
                                         );
                                         if start_btn.clicked() {
-                                            let url_to_play = opt.url.clone();
-                                            let hash_clone = hash.clone();
+	                                            let url_to_play = opt.url.clone();
+	                                            let hash_clone = hash.clone();
+                                                let title_for_launch = title.clone();
                                             let quality_clone = opt.quality.clone();
                                             let parent_dir_name = torrent.dir_name.clone();
                                             let children_clone = self.spawned_children.clone();
@@ -3708,33 +4822,26 @@ impl PanelRenderHelper for AppState {
                                             thread::spawn(move || {
                                                 let mut children = children_clone.lock().unwrap();
  
-                                                let dest = format!("./stream_cache/{}/{}", parent_dir_name, quality_clone);
-                                                let dest_dir = PathBuf::from(&dest);
-                                                let local_torrent_path = format!("./stream_cache/{}/{}/movie.torrent", parent_dir_name, quality_clone);
-                                                let mut torrent_source = url_to_play.clone();
- 
-                                                let _ = fs::create_dir_all(&dest_dir);
- 
-                                                if std::path::Path::new(&local_torrent_path).exists() {
-                                                    torrent_source = local_torrent_path;
-                                                } else if let Some(h) = get_infohash(&url_to_play) {
-                                                    let torrent_url = format!("https://itorrents.net/torrent/{}.torrent", h);
-                                                    let download_res = Command::new("curl")
-                                                        .args(&["-s", "-L", "-o", &local_torrent_path, &torrent_url])
-                                                        .status();
-                                                    if download_res.is_ok() && std::path::Path::new(&local_torrent_path).exists() {
-                                                        torrent_source = local_torrent_path;
-                                                    }
-                                                }
- 
-                                                {
-                                                    let mut map = torrent_status_clone.lock().unwrap();
-                                                    map.insert(hash_clone.clone(), PerTorrentStatus {
-                                                        active: true,
-                                                        speed: "Connecting...".to_string(),
-                                                        downloaded: "0 MB".to_string(),
-                                                        peers: String::new(),
-                                                    });
+	                                                let dest = format!("./stream_cache/{}/{}", parent_dir_name, quality_clone);
+	                                                let dest_dir = PathBuf::from(&dest);
+	                                                let local_torrent_path = format!("./stream_cache/{}/{}/movie.torrent", parent_dir_name, quality_clone);
+	                                                let torrent_source = launch_source_from_url_or_hash(
+                                                        &url_to_play,
+                                                        &hash_clone,
+                                                        &title_for_launch,
+                                                        &local_torrent_path,
+                                                    );
+	 
+	                                                let _ = fs::create_dir_all(&dest_dir);
+	 
+	                                                {
+	                                                    let mut map = torrent_status_clone.lock().unwrap();
+	                                                    map.insert(hash_clone.clone(), PerTorrentStatus {
+	                                                        active: true,
+	                                                        speed: "Connecting...".to_string(),
+	                                                        downloaded: "0 MB".to_string(),
+	                                                        peers: "connecting".to_string(),
+	                                                    });
                                                 }
                                                 ctx_clone.request_repaint();
  
@@ -3760,64 +4867,31 @@ impl PanelRenderHelper for AppState {
                                                 cmd.stdout(std::process::Stdio::piped());
                                                 cmd.stderr(std::process::Stdio::piped());
  
-                                                let spawn_res = cmd.spawn();
-                                                if let Ok(mut child) = spawn_res {
-                                                    let _child_pid = child.id();
-                                                    if let Some(stderr) = child.stderr.take() {
-                                                        let err_reader = std::io::BufReader::new(stderr);
-                                                        thread::spawn(move || {
-                                                            for line_res in err_reader.lines().flatten() {
-                                                                if !line_res.trim().is_empty() {
-                                                                    println!("[WEBTORRENT ERR] {}", line_res);
-                                                                }
-                                                            }
-                                                        });
-                                                    }
-                                                    if let Some(stdout) = child.stdout.take() {
-                                                        let reader = std::io::BufReader::new(stdout);
-                                                        let status_clone_2 = torrent_status_clone.clone();
-                                                        let ctx_clone_2 = ctx_clone.clone();
-                                                        let progress_dir = dest_dir.clone();
-                                                        let progress_dir_name = hash_clone.clone();
-                                                        thread::spawn(move || {
-                                                            let mut buffer = String::new();
-                                                            let mut br = std::io::BufReader::new(reader);
-                                                            while let Ok(bytes) = br.read_line(&mut buffer) {
-                                                                if bytes == 0 {
-                                                                    break;
-                                                                }
-                                                                if is_webtorrent_seeding_line(&buffer) {
-                                                                    let mut map = status_clone_2.lock().unwrap();
-                                                                    if let Some(s) = map.get_mut(&progress_dir_name) {
-                                                                        s.active = false;
-                                                                    }
-                                                                    ctx_clone_2.request_repaint();
-                                                                    break;
-                                                                }
-                                                                if let Some(update) = parse_webtorrent_line(&buffer) {
-                                                                    if let Some(ref downloaded) = update.downloaded {
-                                                                        write_torrent_progress(&progress_dir, downloaded);
-                                                                    }
-                                                                    let mut map = status_clone_2.lock().unwrap();
-                                                                    if let Some(s) = map.get_mut(&progress_dir_name) {
-                                                                        if let Some(speed) = update.speed {
-                                                                            s.speed = speed;
-                                                                        }
-                                                                        if let Some(downloaded) = update.downloaded {
-                                                                            s.downloaded = downloaded;
-                                                                        }
-                                                                        if let Some(peers) = update.peers {
-                                                                            s.peers = peers;
-                                                                        }
-                                                                    }
-                                                                    ctx_clone_2.request_repaint();
-                                                                }
-                                                                buffer.clear();
-                                                            }
-                                                        });
-                                                    }
-                                                    children.push(child);
-                                                }
+	                                                let spawn_res = cmd.spawn();
+	                                                if let Ok(mut child) = spawn_res {
+	                                                    let _child_pid = child.id();
+	                                                    if let Some(stderr) = child.stderr.take() {
+	                                                        spawn_webtorrent_output_reader(
+	                                                            stderr,
+	                                                            "WEBTORRENT ERR",
+	                                                            torrent_status_clone.clone(),
+	                                                            hash_clone.clone(),
+	                                                            dest_dir.clone(),
+	                                                            ctx_clone.clone(),
+	                                                        );
+	                                                    }
+	                                                    if let Some(stdout) = child.stdout.take() {
+	                                                        spawn_webtorrent_output_reader(
+	                                                            stdout,
+	                                                            "WEBTORRENT",
+	                                                            torrent_status_clone.clone(),
+	                                                            hash_clone.clone(),
+	                                                            dest_dir.clone(),
+	                                                            ctx_clone.clone(),
+	                                                        );
+	                                                    }
+	                                                    children.push(child);
+	                                                }
                                             });
                                             self.status_message = format!("Starting {} torrent download...", opt.quality);
                                         }
@@ -3860,24 +4934,26 @@ impl PanelRenderHelper for AppState {
  
                                         let delete_file_btn = ui.add_sized(
                                             [150.0, 40.0],
-                                            egui::Button::new("🗑 Delete Files")
+                                            egui::Button::new("🗑 Delete File")
                                                 .fill(egui::Color32::from_rgb(145, 70, 35)),
-                                        );
-                                        if delete_file_btn.clicked() {
-                                            let _ = fs::remove_dir_all(&quality_path);
-                                            self.refresh();
-                                        }
-                                    });
+	                                        );
+	                                        if delete_file_btn.clicked() {
+                                                if let Some(ref media_path) = local_media {
+	                                                self.pending_delete_file = Some((quality_path.clone(), media_path.clone()));
+                                                }
+	                                        }
+	                                    });
                                 });
                             });
-                        });
-                        ui.add_space(8.0);
-                    }
-                }
-            }
+	                        });
+	                        ui.add_space(8.0);
+	                    }
+                        }
+	                }
+	            }
         }
  
-        if let Some(torrent) = group.torrents.first() {
+        if let Some(torrent) = primary_torrent {
             let parent_cache_path = get_cache_dir().join(&torrent.dir_name);
             let show_quality_local_status = if let Some(ref meta) = torrent.metadata {
                 if let Some(ref options) = meta.torrent_options {
@@ -3898,7 +4974,7 @@ impl PanelRenderHelper for AppState {
                 false
             };
 
-            if show_quality_local_status {
+            if false && show_quality_local_status {
                 ui.label(egui::RichText::new("Additional Quality Options Local Status:").strong());
                 ui.add_space(6.0);
 
@@ -3923,13 +4999,27 @@ impl PanelRenderHelper for AppState {
                                         ui.label(egui::RichText::new(format!("Quality Stream: {}", opt.quality)).strong());
                                         ui.add_space(4.0);
  
-                                        ui.horizontal(|ui| {
-                                            ui.label(egui::RichText::new("Info Hash:").strong());
-                                            ui.label(&opt.hash);
-                                        });
- 
-                                        ui.horizontal(|ui| {
-                                            ui.label(egui::RichText::new("Subfolder Path:").strong());
+	                                        ui.horizontal(|ui| {
+	                                            ui.label(egui::RichText::new("Info Hash:").strong());
+	                                            ui.label(&opt.hash);
+	                                        });
+
+                                        let display_magnet = launch_magnet_for_display(&opt.url, &opt.hash, &title);
+                                        if should_show_source_url(&opt.url, &display_magnet) {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.label(egui::RichText::new("Source URL:").strong());
+                                                ui.monospace(display_source_url(&opt.url));
+                                            });
+                                        }
+                                        if !display_magnet.is_empty() {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.label(egui::RichText::new("Launch Magnet:").strong());
+                                                ui.monospace(&display_magnet);
+                                            });
+                                        }
+	 
+	                                        ui.horizontal(|ui| {
+	                                            ui.label(egui::RichText::new("Subfolder Path:").strong());
                                             ui.label(format!("./stream_cache/{}/{}", torrent.dir_name, opt.quality));
                                         });
  
@@ -4024,6 +5114,116 @@ impl PanelRenderHelper for AppState {
                                         ui.add_space(8.0);
  
                                         ui.horizontal(|ui| {
+                                            let is_this_active = is_active;
+                                            if is_this_active {
+                                                let stop_btn = ui.add_sized(
+                                                    [160.0, 40.0],
+                                                    egui::Button::new(
+                                                        egui::RichText::new("⏹ Stop Torrent")
+                                                            .font(egui::FontId::proportional(14.0))
+                                                            .strong(),
+                                                    )
+                                                    .fill(egui::Color32::from_rgb(180, 40, 40)),
+                                                );
+                                                if stop_btn.clicked() {
+                                                    let dir_to_stop = opt.hash.clone();
+                                                    let children_clone = self.spawned_children.clone();
+                                                    let torrent_status_clone = self.torrent_status.clone();
+                                                    thread::spawn(move || {
+                                                        let mut children = children_clone.lock().unwrap();
+                                                        for child in children.iter_mut() {
+                                                            let _ = child.kill();
+                                                        }
+                                                        children.clear();
+                                                        let _ = Command::new("pkill")
+                                                            .args(&["-9", "-i", "-f", "webtorrent"])
+                                                            .status();
+                                                        let mut map = torrent_status_clone.lock().unwrap();
+                                                        if let Some(s) = map.get_mut(&dir_to_stop) {
+                                                            s.active = false;
+                                                        }
+                                                    });
+                                                    self.status_message = "Stopping torrent...".to_string();
+                                                }
+                                            } else {
+                                                let play_btn = ui.add_sized(
+                                                    [160.0, 40.0],
+                                                    egui::Button::new(
+                                                        egui::RichText::new("🧲 Start Torrent")
+                                                            .font(egui::FontId::proportional(14.0))
+                                                            .strong(),
+                                                    )
+                                                    .fill(egui::Color32::from_rgb(0, 160, 80)),
+                                                );
+                                                if play_btn.clicked() {
+	                                                    let url_to_play = opt.url.clone();
+	                                                    let dir_to_play = format!("{}/{}", torrent.dir_name, opt.quality);
+	                                                    let hash_clone = opt.hash.clone();
+	                                                    let title_for_launch = title.clone();
+                                                    let children_clone = self.spawned_children.clone();
+                                                    let torrent_status_clone = self.torrent_status.clone();
+                                                    let ctx_clone = ctx.clone();
+                                                    thread::spawn(move || {
+                                                        let mut children = children_clone.lock().unwrap();
+	                                                        let dest = format!("./stream_cache/{}", dir_to_play);
+	                                                        let dest_dir = PathBuf::from(&dest);
+	                                                        let local_torrent_path = format!("./stream_cache/{}/movie.torrent", dir_to_play);
+	                                                        let torrent_source = launch_source_from_url_or_hash(
+                                                                &url_to_play,
+                                                                &hash_clone,
+                                                                &title_for_launch,
+                                                                &local_torrent_path,
+                                                            );
+	                                                        let _ = fs::create_dir_all(&dest_dir);
+	                                                        {
+	                                                            let mut map = torrent_status_clone.lock().unwrap();
+	                                                            map.insert(hash_clone.clone(), PerTorrentStatus {
+	                                                                active: true,
+	                                                                speed: "Connecting...".to_string(),
+	                                                                downloaded: "0 MB".to_string(),
+	                                                                peers: "connecting".to_string(),
+	                                                            });
+                                                        }
+                                                        ctx_clone.request_repaint();
+                                                        write_torrent_progress(&dest_dir, "0 B");
+                                                        spawn_gap_aware_progress_scanner(
+                                                            dest_dir.clone(),
+                                                            hash_clone.clone(),
+                                                            torrent_status_clone.clone(),
+                                                        );
+                                                        let free_port = get_free_port().unwrap_or(8080);
+                                                        let mut cmd = Command::new("npx");
+                                                        cmd.args(&["-y", "webtorrent-cli", "download", &torrent_source, "--port", &free_port.to_string(), "--out", &dest]);
+                                                        cmd.stdout(std::process::Stdio::piped());
+                                                        cmd.stderr(std::process::Stdio::piped());
+	                                                        if let Ok(mut child) = cmd.spawn() {
+	                                                            if let Some(stderr) = child.stderr.take() {
+	                                                                spawn_webtorrent_output_reader(
+	                                                                    stderr,
+	                                                                    "WEBTORRENT ERR",
+	                                                                    torrent_status_clone.clone(),
+	                                                                    hash_clone.clone(),
+	                                                                    dest_dir.clone(),
+	                                                                    ctx_clone.clone(),
+	                                                                );
+	                                                            }
+	                                                            if let Some(stdout) = child.stdout.take() {
+	                                                                spawn_webtorrent_output_reader(
+	                                                                    stdout,
+	                                                                    "WEBTORRENT",
+	                                                                    torrent_status_clone.clone(),
+	                                                                    hash_clone.clone(),
+	                                                                    dest_dir.clone(),
+	                                                                    ctx_clone.clone(),
+	                                                                );
+	                                                            }
+	                                                            children.push(child);
+	                                                        }
+                                                    });
+                                                    self.status_message = "Starting torrent download...".to_string();
+                                                }
+                                            }
+
                                             if let Some(media_path) = local_media.clone() {
                                                 let play_local_btn = ui.add_sized(
                                                     [160.0, 40.0],
@@ -4058,14 +5258,15 @@ impl PanelRenderHelper for AppState {
  
                                                 let delete_file_btn = ui.add_sized(
                                                     [150.0, 40.0],
-                                                    egui::Button::new("🗑 Delete Files")
+                                                    egui::Button::new("🗑 Delete File")
                                                         .fill(egui::Color32::from_rgb(145, 70, 35)),
-                                                );
-                                                if delete_file_btn.clicked() {
-                                                    let _ = fs::remove_dir_all(&quality_path);
-                                                    self.refresh();
-                                                }
-                                            }
+	                                                );
+	                                                if delete_file_btn.clicked() {
+                                                        if let Some(ref media_path) = local_media {
+	                                                        self.pending_delete_file = Some((quality_path.clone(), media_path.clone()));
+                                                        }
+	                                                }
+	                                            }
                                         });
                                     });
                                 });
@@ -4078,12 +5279,24 @@ impl PanelRenderHelper for AppState {
                 // Check and render root cache folder (backward compatibility and single-torrent fallback)
                 let root_media = find_media_file(&parent_cache_path);
                 let root_has_torrent = parent_cache_path.join("movie.torrent").exists();
-                let root_is_active = {
-                    let map = self.torrent_status.lock().unwrap();
-                    map.get(&torrent.dir_name).map(|s| s.active).unwrap_or(false)
-                };
- 
-                if (root_has_torrent || root_media.is_some() || root_is_active) && !rendered_any {
+	                let root_is_active = {
+	                    let map = self.torrent_status.lock().unwrap();
+	                    map.get(&torrent.dir_name).map(|s| s.active).unwrap_or(false)
+	                };
+                    let root_hash_matches_option = torrent
+                        .dir_name
+                        .strip_prefix("torrent_")
+                        .is_some_and(|root_hash| {
+                            torrent
+                                .metadata
+                                .as_ref()
+                                .and_then(|meta| meta.torrent_options.as_ref())
+                                .is_some_and(|options| {
+                                    options.iter().any(|opt| opt.hash.eq_ignore_ascii_case(root_hash))
+                                })
+                        });
+	 
+	                if (root_has_torrent || root_media.is_some() || root_is_active) && !rendered_any && !root_hash_matches_option {
                     rendered_any = true;
                     ui.group(|ui| {
                         ui.vertical(|ui| {
@@ -4102,12 +5315,26 @@ impl PanelRenderHelper for AppState {
                                 None
                             };
  
-                            if let Some(hash) = hash_opt {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("Info Hash:").strong());
-                                    ui.label(hash.to_uppercase());
-                                });
-                            }
+	                            if let Some(hash) = hash_opt {
+	                                ui.horizontal(|ui| {
+	                                    ui.label(egui::RichText::new("Info Hash:").strong());
+	                                    ui.label(hash.to_uppercase());
+	                                });
+                                    let source_url = torrent.metadata.as_ref().map(|m| m.url.clone()).unwrap_or_default();
+                                    let display_magnet = launch_magnet_for_display(&source_url, hash, &title);
+                                    if should_show_source_url(&source_url, &display_magnet) {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new("Source URL:").strong());
+                                        ui.monospace(display_source_url(&source_url));
+                                    });
+                                    }
+                                    if !display_magnet.is_empty() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(egui::RichText::new("Launch Magnet:").strong());
+                                            ui.monospace(&display_magnet);
+                                        });
+                                    }
+	                            }
  
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new("Subfolder Path:").strong());
@@ -4246,7 +5473,12 @@ impl PanelRenderHelper for AppState {
                                         .fill(egui::Color32::from_rgb(0, 160, 80)),
                                     );
                                     if play_btn.clicked() {
-                                        let url_to_play = torrent.metadata.as_ref().map(|m| m.url.clone()).unwrap_or_default();
+	                                        let url_to_play = torrent.metadata.as_ref().map(|m| m.url.clone()).unwrap_or_default();
+                                            let root_hash_for_launch = torrent
+                                                .dir_name
+                                                .strip_prefix("torrent_")
+                                                .unwrap_or_default()
+                                                .to_string();
                                         let dir_to_play = torrent.dir_name.clone();
                                         let children_clone = self.spawned_children.clone();
                                         let torrent_status_clone = self.torrent_status.clone();
@@ -4254,33 +5486,26 @@ impl PanelRenderHelper for AppState {
                                         thread::spawn(move || {
                                             let mut children = children_clone.lock().unwrap();
  
-                                            let dest = format!("./stream_cache/{}", dir_to_play);
-                                            let dest_dir = PathBuf::from(&dest);
-                                            let local_torrent_path = format!("./stream_cache/{}/movie.torrent", dir_to_play);
-                                            let mut torrent_source = url_to_play.clone();
- 
-                                            let _ = fs::create_dir_all(&dest_dir);
- 
-                                            if std::path::Path::new(&local_torrent_path).exists() {
-                                                torrent_source = local_torrent_path;
-                                            } else if let Some(h) = get_infohash(&url_to_play) {
-                                                let torrent_url = format!("https://itorrents.net/torrent/{}.torrent", h);
-                                                let download_res = Command::new("curl")
-                                                    .args(&["-s", "-L", "-o", &local_torrent_path, &torrent_url])
-                                                    .status();
-                                                if download_res.is_ok() && std::path::Path::new(&local_torrent_path).exists() {
-                                                    torrent_source = local_torrent_path;
-                                                }
-                                            }
- 
-                                            {
-                                                let mut map = torrent_status_clone.lock().unwrap();
-                                                map.insert(dir_to_play.clone(), PerTorrentStatus {
-                                                    active: true,
-                                                    speed: "Connecting...".to_string(),
-                                                    downloaded: "0 MB".to_string(),
-                                                    peers: String::new(),
-                                                });
+	                                            let dest = format!("./stream_cache/{}", dir_to_play);
+	                                            let dest_dir = PathBuf::from(&dest);
+	                                            let local_torrent_path = format!("./stream_cache/{}/movie.torrent", dir_to_play);
+	                                            let torrent_source = launch_source_from_url_or_hash(
+                                                    &url_to_play,
+                                                    &root_hash_for_launch,
+                                                    "Movie",
+                                                    &local_torrent_path,
+                                                );
+	 
+	                                            let _ = fs::create_dir_all(&dest_dir);
+	 
+	                                            {
+	                                                let mut map = torrent_status_clone.lock().unwrap();
+	                                                map.insert(dir_to_play.clone(), PerTorrentStatus {
+	                                                    active: true,
+	                                                    speed: "Connecting...".to_string(),
+	                                                    downloaded: "0 MB".to_string(),
+	                                                    peers: "connecting".to_string(),
+	                                                });
                                             }
                                             ctx_clone.request_repaint();
  
@@ -4306,64 +5531,31 @@ impl PanelRenderHelper for AppState {
                                             cmd.stdout(std::process::Stdio::piped());
                                             cmd.stderr(std::process::Stdio::piped());
  
-                                            let spawn_res = cmd.spawn();
-                                            if let Ok(mut child) = spawn_res {
-                                                let _child_pid = child.id();
-                                                if let Some(stderr) = child.stderr.take() {
-                                                    let err_reader = std::io::BufReader::new(stderr);
-                                                    thread::spawn(move || {
-                                                        for line_res in err_reader.lines().flatten() {
-                                                            if !line_res.trim().is_empty() {
-                                                                println!("[WEBTORRENT ERR] {}", line_res);
-                                                            }
-                                                        }
-                                                    });
-                                                }
-                                                if let Some(stdout) = child.stdout.take() {
-                                                    let reader = std::io::BufReader::new(stdout);
-                                                    let status_clone_2 = torrent_status_clone.clone();
-                                                    let ctx_clone_2 = ctx_clone.clone();
-                                                    let progress_dir = dest_dir.clone();
-                                                    let progress_dir_name = dir_to_play.clone();
-                                                    thread::spawn(move || {
-                                                        let mut buffer = String::new();
-                                                        let mut br = std::io::BufReader::new(reader);
-                                                        while let Ok(bytes) = br.read_line(&mut buffer) {
-                                                            if bytes == 0 {
-                                                                break;
-                                                            }
-                                                            if is_webtorrent_seeding_line(&buffer) {
-                                                                let mut map = status_clone_2.lock().unwrap();
-                                                                if let Some(s) = map.get_mut(&progress_dir_name) {
-                                                                    s.active = false;
-                                                                }
-                                                                ctx_clone_2.request_repaint();
-                                                                break;
-                                                            }
-                                                            if let Some(update) = parse_webtorrent_line(&buffer) {
-                                                                if let Some(ref downloaded) = update.downloaded {
-                                                                    write_torrent_progress(&progress_dir, downloaded);
-                                                                }
-                                                                let mut map = status_clone_2.lock().unwrap();
-                                                                if let Some(s) = map.get_mut(&progress_dir_name) {
-                                                                    if let Some(speed) = update.speed {
-                                                                        s.speed = speed;
-                                                                    }
-                                                                    if let Some(downloaded) = update.downloaded {
-                                                                        s.downloaded = downloaded;
-                                                                    }
-                                                                    if let Some(peers) = update.peers {
-                                                                        s.peers = peers;
-                                                                    }
-                                                                }
-                                                                ctx_clone_2.request_repaint();
-                                                            }
-                                                            buffer.clear();
-                                                        }
-                                                    });
-                                                }
-                                                children.push(child);
-                                            }
+	                                            let spawn_res = cmd.spawn();
+	                                            if let Ok(mut child) = spawn_res {
+	                                                let _child_pid = child.id();
+	                                                if let Some(stderr) = child.stderr.take() {
+	                                                    spawn_webtorrent_output_reader(
+	                                                        stderr,
+	                                                        "WEBTORRENT ERR",
+	                                                        torrent_status_clone.clone(),
+	                                                        dir_to_play.clone(),
+	                                                        dest_dir.clone(),
+	                                                        ctx_clone.clone(),
+	                                                    );
+	                                                }
+	                                                if let Some(stdout) = child.stdout.take() {
+	                                                    spawn_webtorrent_output_reader(
+	                                                        stdout,
+	                                                        "WEBTORRENT",
+	                                                        torrent_status_clone.clone(),
+	                                                        dir_to_play.clone(),
+	                                                        dest_dir.clone(),
+	                                                        ctx_clone.clone(),
+	                                                    );
+	                                                }
+	                                                children.push(child);
+	                                            }
                                         });
                                         self.status_message = "Starting torrent download...".to_string();
                                     }
@@ -4403,13 +5595,12 @@ impl PanelRenderHelper for AppState {
  
                                     let delete_file_btn = ui.add_sized(
                                         [150.0, 40.0],
-                                        egui::Button::new("🗑 Delete Files")
+                                        egui::Button::new("🗑 Delete File")
                                             .fill(egui::Color32::from_rgb(145, 70, 35)),
-                                    );
-                                    if delete_file_btn.clicked() {
-                                        delete_local_media_file(&parent_cache_path, &media_path);
-                                        self.refresh();
-                                    }
+	                                    );
+	                                    if delete_file_btn.clicked() {
+	                                        self.pending_delete_file = Some((parent_cache_path.clone(), media_path.clone()));
+	                                    }
                                 }
                             });
                         });
@@ -4432,40 +5623,9 @@ impl PanelRenderHelper for AppState {
                     egui::Button::new("🗑 Delete Film Library Item")
                         .fill(egui::Color32::from_rgb(180, 40, 40)),
                 );
-                if delete_btn.clicked() {
-                    let children_clone = self.spawned_children.clone();
-                    let torrent_status_clone = self.torrent_status.clone();
-                    
-                    if let Some(ref meta) = torrent.metadata {
-                        if let Some(ref options) = meta.torrent_options {
-                            for opt in options {
-                                let hash_clone = opt.hash.to_uppercase();
-                                let ts_clone = torrent_status_clone.clone();
-                                thread::spawn(move || {
-                                    let mut map = ts_clone.lock().unwrap();
-                                    map.remove(&hash_clone);
-                                });
-                            }
-                        }
-                    }
-                    
-                    thread::spawn(move || {
-                        let mut children = children_clone.lock().unwrap();
-                        for child in children.iter_mut() {
-                            let _ = child.kill();
-                        }
-                        children.clear();
-                        let _ = Command::new("pkill")
-                            .args(&["-9", "-i", "-f", "webtorrent"])
-                            .status();
-                    });
- 
-                    if parent_cache_path.exists() {
-                        let _ = fs::remove_dir_all(&parent_cache_path);
-                    }
-                    self.selected_idx = None;
-                    self.refresh();
-                }
+	                if delete_btn.clicked() {
+                        self.pending_delete_dir = Some(parent_cache_path.clone());
+	                }
             }
     }
 }

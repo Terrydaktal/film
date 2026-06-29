@@ -25,3 +25,12 @@ Screenshot_*.png
 scraped_domains.json
 scratch_*.html
 yts_*.html
+
+# One-off recovery and diff extraction helpers
+dump_all_steps.py
+dump_edits.py
+recover_code.py
+recover_old_steps.py
+extract_json_args.py
+extract_step_details.py
+step_*_edit.json
