@@ -493,7 +493,12 @@ local function torrent_progress_ranges()
             local range_start = limit_range(0, 1, range[1] / total) * 100
             local range_end = math.min(limit_range(0, 1, range[2] / total), range_cap) * 100
             if range_end > range_start then
-                capped_ranges[#capped_ranges + 1] = {start = range_start, ["end"] = range_end}
+                capped_ranges[#capped_ranges + 1] = {
+                    start = range_start,
+                    ["end"] = range_end,
+                    byte_start = range[1],
+                    byte_end = range[2],
+                }
             end
         end
         return capped_ranges, total
@@ -1093,18 +1098,26 @@ local function render_elements(master_ass)
             if element == state.slider_element then
                 local torrentRanges = torrent_progress_ranges()
                 if torrentRanges then
-                    local torrentH = math.min(4, math.max(2, innerH / 2))
+                    local torrentH = math.min(3, math.max(1, innerH / 3))
                     local torrentY1 = (elem_geo.h / 2) - (torrentH / 2)
                     local torrentY2 = (elem_geo.h / 2) + (torrentH / 2)
+                    local prev_draw_end = nil
+                    local prev_byte_end = nil
 
                     elem_ass:draw_stop()
                     elem_ass:merge(style_ass)
-                    elem_ass:append("{\\1c&H55CC00&\\1a&H55&}")
+                    elem_ass:append("{\\1c&H55CC00&\\1a&H77&}")
                     elem_ass:draw_start()
 
                     for _, range in ipairs(torrentRanges) do
                         local pstart = get_slider_ele_pos_for(element, range["start"])
                         local pend = get_slider_ele_pos_for(element, range["end"])
+                        local has_real_gap = prev_byte_end ~= nil
+                            and range.byte_start ~= nil
+                            and range.byte_start > prev_byte_end
+                        if has_real_gap and prev_draw_end ~= nil and pstart <= prev_draw_end then
+                            pstart = prev_draw_end + 1
+                        end
                         if pend > pstart then
                             if slider_lo.stype == "bar" then
                                 elem_ass:rect_cw(pstart, torrentY1, pend, torrentY2)
@@ -1112,7 +1125,9 @@ local function render_elements(master_ass)
                                 ass_draw_rr_h_cw(elem_ass, pstart, foH - 1, pend, foH + 1, 1,
                                                  slider_lo.stype == "diamond")
                             end
+                            prev_draw_end = pend
                         end
+                        prev_byte_end = range.byte_end
                     end
                     elem_ass:draw_stop()
                 end
