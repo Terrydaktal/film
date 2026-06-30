@@ -1521,6 +1521,18 @@ impl SearchSource {
             SearchSource::ExtTo => "ext_search_report.json",
         }
     }
+
+    fn supports_pagination(self) -> bool {
+        matches!(self, SearchSource::Yify | SearchSource::SolidTorrents)
+    }
+
+    fn page_size(self) -> usize {
+        match self {
+            SearchSource::Yify => 50,
+            SearchSource::SolidTorrents => 100,
+            SearchSource::X1337 | SearchSource::ExtTo => 100,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1682,11 +1694,71 @@ fn percent_encode(text: &str) -> String {
     encoded
 }
 
-fn scrape_yts_html_fallback(agent: &ureq::Agent, mirror: &str, query: &str) -> Vec<YtsMovie> {
+fn scrape_yify_api_page(
+    agent: &ureq::Agent,
+    mirror: &str,
+    query: &str,
+    page: usize,
+) -> (Vec<YtsMovie>, Option<usize>) {
+    let encoded = percent_encode(query);
+    let page = page.max(1);
+    let limit = SearchSource::Yify.page_size();
+    let url = format!(
+        "{}/api/v2/list_movies.json?query_term={}&limit={}&page={}",
+        mirror.trim_end_matches('/'),
+        encoded,
+        limit,
+        page
+    );
+    let Ok(mut resp) = agent
+        .get(&url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+        .call()
+    else {
+        return (Vec::new(), None);
+    };
+    let Ok(body) = resp.body_mut().read_to_string() else {
+        return (Vec::new(), None);
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return (Vec::new(), None);
+    };
+    if val["status"] != "ok" {
+        return (Vec::new(), None);
+    }
+
+    let mut parsed_movies = Vec::new();
+    if let Some(movies_arr) = val["data"]["movies"].as_array() {
+        for m_val in movies_arr {
+            if let Ok(movie) = serde_json::from_value::<YtsMovie>(m_val.clone()) {
+                parsed_movies.push(movie);
+            }
+        }
+    }
+    let total_pages = val["data"]["movie_count"]
+        .as_u64()
+        .map(|count| ((count as usize).saturating_add(limit - 1)) / limit)
+        .map(|pages| pages.max(1));
+    (parsed_movies, total_pages)
+}
+
+fn scrape_yts_html_fallback(
+    agent: &ureq::Agent,
+    mirror: &str,
+    query: &str,
+    page: usize,
+) -> Vec<YtsMovie> {
     let mut movies = Vec::new();
     let encoded = percent_encode(query);
-    // Standard search query pattern for YTS HTML sites
-    let url = format!("{}/?keyword={}", mirror, encoded);
+    let page = page.max(1);
+    let url = if page == 1 {
+        format!("{}/?keyword={}", mirror, encoded)
+    } else {
+        format!("{}/?keyword={}&page={}", mirror, encoded, page)
+    };
     
     let res = agent.get(&url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -2011,25 +2083,38 @@ fn solidtorrents_size_string(value: &serde_json::Value) -> String {
     "Unknown".to_string()
 }
 
-fn scrape_solidtorrents_api(agent: &ureq::Agent, mirror: &str, query: &str) -> Vec<YtsMovie> {
+fn scrape_solidtorrents_api_page(
+    agent: &ureq::Agent,
+    mirror: &str,
+    query: &str,
+    page: usize,
+) -> (Vec<YtsMovie>, Option<usize>) {
     let encoded = percent_encode(query);
-    let url = format!("{}/api/v1/search?q={}&limit=100", mirror.trim_end_matches('/'), encoded);
+    let page = page.max(1);
+    let per_page = SearchSource::SolidTorrents.page_size();
+    let url = format!(
+        "{}/api/v1/search?q={}&limit={}&page={}",
+        mirror.trim_end_matches('/'),
+        encoded,
+        per_page,
+        page
+    );
     let res = agent
         .get(&url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .call();
 
     let Ok(mut resp) = res else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let Ok(body) = resp.body_mut().read_to_string() else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     if value["success"] != true {
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     let mut movies = Vec::new();
@@ -2087,7 +2172,20 @@ fn scrape_solidtorrents_api(agent: &ureq::Agent, mirror: &str, query: &str) -> V
             });
         }
     }
-    movies
+    let total_pages = value["totalPages"]
+        .as_u64()
+        .map(|v| v as usize)
+        .or_else(|| {
+            let total = value["total"].as_u64()? as usize;
+            let per_page = value["perPage"]
+                .as_u64()
+                .map(|v| v as usize)
+                .unwrap_or(per_page)
+                .max(1);
+            Some((total.saturating_add(per_page - 1)) / per_page)
+        })
+        .map(|pages| pages.max(1));
+    (movies, total_pages)
 }
 
 fn extract_first_href_with_markers(section: &str, markers: &[&str]) -> Option<String> {
@@ -2639,7 +2737,17 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
         let cache_dir_path = get_cache_dir().join(&torrent.dir_name);
         if let Some((downloaded, total)) = get_torrent_downloaded_and_total(&cache_dir_path) {
             let live_downloaded = downloaded.max(get_folder_disk_space(&cache_dir_path)).min(total);
-            entries.push(format!("{} / {}", format_size(live_downloaded), format_size(total)));
+            let pct = if total > 0 {
+                (live_downloaded as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
+            entries.push(format!(
+                "{} / {} ({:.2}%)",
+                format_size(live_downloaded),
+                format_size(total),
+                pct
+            ));
         }
 
         if let Some(ref meta) = torrent.metadata {
@@ -2650,10 +2758,16 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
                     {
                         let live_downloaded =
                             downloaded.max(get_folder_disk_space(&quality_path)).min(total);
+                        let pct = if total > 0 {
+                            (live_downloaded as f64 / total as f64) * 100.0
+                        } else {
+                            0.0
+                        };
                         entries.push(format!(
-                            "{} / {}",
+                            "{} / {} ({:.2}%)",
                             format_size(live_downloaded),
-                            format_size(total)
+                            format_size(total),
+                            pct
                         ));
                     }
                 }
@@ -2664,7 +2778,7 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
     entries.sort();
     entries.dedup();
     if !entries.is_empty() {
-        return entries.join("   ");
+        return entries.join(" ");
     }
 
     let live_disk_used: u64 = group
@@ -2672,7 +2786,11 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
         .iter()
         .map(|torrent| get_folder_disk_space(&get_cache_dir().join(&torrent.dir_name)))
         .sum();
-    format_size(live_disk_used)
+    format!("0 B ({})", format_size(live_disk_used))
+}
+
+fn has_local_cache_artifacts(cache_dir: &std::path::Path) -> bool {
+    cache_dir.exists() && get_folder_disk_space(cache_dir) > 0
 }
 
 /// Returns a sorted, deduplicated list of language names found in cached subtitle files.
@@ -3101,12 +3219,17 @@ fn run_mirror_diagnostics(
     }
 }
 
-fn refresh_cached_seeds_and_peers(cache_dir: PathBuf, ctx: egui::Context) {
+fn refresh_cached_seeds_and_peers(
+    cache_dir: PathBuf,
+    ctx: egui::Context,
+    status_sink: Arc<Mutex<Option<String>>>,
+) {
     thread::spawn(move || {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(5)))
             .build();
         let agent: ureq::Agent = config.into();
+        let mut files_updated = 0u32;
 
         if let Ok(entries) = fs::read_dir(&cache_dir) {
             for entry in entries.flatten() {
@@ -3148,6 +3271,7 @@ fn refresh_cached_seeds_and_peers(cache_dir: PathBuf, ctx: egui::Context) {
                                                             if updated {
                                                                 if let Ok(new_content) = serde_json::to_string_pretty(&meta) {
                                                                     let _ = fs::write(&metadata_path, new_content);
+                                                                    files_updated += 1;
                                                                 }
                                                             }
                                                         }
@@ -3163,6 +3287,12 @@ fn refresh_cached_seeds_and_peers(cache_dir: PathBuf, ctx: egui::Context) {
                 }
             }
         }
+        let message = if files_updated > 0 {
+            format!("Refresh complete; updated seeds and leechers for {} cached entr{}.", files_updated, if files_updated == 1 { "y" } else { "ies" })
+        } else {
+            "Refresh complete; no cached seed or leecher changes found.".to_string()
+        };
+        *status_sink.lock().unwrap() = Some(message);
         ctx.request_repaint();
     });
 }
@@ -3197,15 +3327,19 @@ struct AppState {
 
     search_query: String,
     search_results: Arc<Mutex<Vec<YtsMovie>>>,
+    search_page: usize,
+    search_total_pages: Arc<Mutex<Option<usize>>>,
     is_searching: Arc<Mutex<bool>>,
     search_status: Arc<Mutex<String>>,
     search_cancelled: Arc<Mutex<bool>>,
     search_source: SearchSource,
+    search_manual_mode: bool,
 
     show_mirror_checker: bool,
     mirror_checker_source: SearchSource,
     mirror_statuses: Arc<Mutex<Vec<MirrorStatus>>>,
     is_checking_mirrors: Arc<Mutex<bool>>,
+    background_status_message: Arc<Mutex<Option<String>>>,
     pending_delete_file: Option<(PathBuf, PathBuf)>,
     pending_delete_dir: Option<PathBuf>,
 }
@@ -3240,14 +3374,18 @@ impl AppState {
             spawned_children,
             search_query: String::new(),
             search_results: Arc::new(Mutex::new(Vec::new())),
+            search_page: 1,
+            search_total_pages: Arc::new(Mutex::new(None)),
             is_searching: Arc::new(Mutex::new(false)),
             search_status: Arc::new(Mutex::new(String::new())),
             search_cancelled: Arc::new(Mutex::new(false)),
             search_source: SearchSource::Yify,
+            search_manual_mode: false,
             show_mirror_checker: false,
             mirror_checker_source: SearchSource::Yify,
             mirror_statuses: Arc::new(Mutex::new(Vec::new())),
             is_checking_mirrors: Arc::new(Mutex::new(false)),
+            background_status_message: Arc::new(Mutex::new(None)),
             pending_delete_file: None,
             pending_delete_dir: None,
         }
@@ -3267,6 +3405,254 @@ impl AppState {
             self.selected_idx = Some(0);
         }
     }
+
+    fn start_search_page(&mut self, ctx: &egui::Context, page: usize) {
+        let query = self.search_query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+
+        let page = page.max(1);
+        self.search_page = page;
+        let search_source = self.search_source;
+        let results_clone = self.search_results.clone();
+        let total_pages_clone = self.search_total_pages.clone();
+        let is_searching_clone = self.is_searching.clone();
+        let status_clone = self.search_status.clone();
+        let search_cancelled_clone = self.search_cancelled.clone();
+        let ctx_clone = ctx.clone();
+
+        *self.is_searching.lock().unwrap() = true;
+        *self.search_cancelled.lock().unwrap() = false;
+        *self.search_total_pages.lock().unwrap() = None;
+        *self.search_status.lock().unwrap() = match search_source {
+            SearchSource::Yify => format!("Stage 1: Searching YIFY JSON APIs (page {})...", page),
+            SearchSource::X1337 => "Searching 1337x HTML mirrors...".to_string(),
+            SearchSource::SolidTorrents => {
+                format!("Searching SolidTorrents APIs (page {})...", page)
+            }
+            SearchSource::ExtTo => "Searching ext mirrors...".to_string(),
+        };
+        results_clone.lock().unwrap().clear();
+
+        thread::spawn(move || {
+            let mirrors = load_search_mirrors(search_source);
+            if mirrors.is_empty() {
+                *status_clone.lock().unwrap() =
+                    format!("Error: {} mirror list not found!", search_source.source_label());
+                *is_searching_clone.lock().unwrap() = false;
+                ctx_clone.request_repaint();
+                return;
+            }
+
+            let total_mirrors = mirrors.len();
+            let active_threads = Arc::new(Mutex::new(total_mirrors));
+            let html_mirrors_to_query = Arc::new(Mutex::new(Vec::new()));
+
+            for mirror in &mirrors {
+                if *search_cancelled_clone.lock().unwrap() {
+                    break;
+                }
+                let query = query.clone();
+                let results_clone = results_clone.clone();
+                let total_pages_clone = total_pages_clone.clone();
+                let status_clone = status_clone.clone();
+                let ctx_clone = ctx_clone.clone();
+                let active_threads = active_threads.clone();
+                let html_mirrors_to_query = html_mirrors_to_query.clone();
+                let search_cancelled_clone = search_cancelled_clone.clone();
+                let mirror = mirror.clone();
+
+                thread::spawn(move || {
+                    if *search_cancelled_clone.lock().unwrap() {
+                        let mut active = active_threads.lock().unwrap();
+                        *active -= 1;
+                        return;
+                    }
+
+                    let config = ureq::Agent::config_builder()
+                        .timeout_global(Some(std::time::Duration::from_secs(4)))
+                        .build();
+                    let agent: ureq::Agent = config.into();
+
+                    let (parsed_movies, is_json_success, page_count_hint) = match search_source {
+                        SearchSource::Yify => {
+                            let (movies, total_pages) =
+                                scrape_yify_api_page(&agent, &mirror, &query, page);
+                            (movies, true, total_pages)
+                        }
+                        SearchSource::SolidTorrents => {
+                            let (movies, total_pages) =
+                                scrape_solidtorrents_api_page(&agent, &mirror, &query, page);
+                            (movies, true, total_pages)
+                        }
+                        SearchSource::ExtTo => {
+                            let movies = scrape_ext_api(&agent, &mirror, &query);
+                            let success = !movies.is_empty();
+                            (movies, success, None)
+                        }
+                        SearchSource::X1337 => {
+                            html_mirrors_to_query.lock().unwrap().push(mirror);
+                            let mut active = active_threads.lock().unwrap();
+                            *active -= 1;
+                            ctx_clone.request_repaint();
+                            return;
+                        }
+                    };
+
+                    if let Some(total_pages) = page_count_hint {
+                        let mut known_pages = total_pages_clone.lock().unwrap();
+                        *known_pages = Some(known_pages.unwrap_or(1).max(total_pages));
+                    }
+
+                    if is_json_success {
+                        if !parsed_movies.is_empty() && !*search_cancelled_clone.lock().unwrap() {
+                            let mut results = results_clone.lock().unwrap();
+                            merge_search_results(&mut results, parsed_movies);
+                            let total_torrents: usize =
+                                results.iter().map(|m| m.torrents.len()).sum();
+                            let mut status = status_clone.lock().unwrap();
+                            *status = format!(
+                                "Stage 1: Updating JSON results for page {} (found {} torrent options)...",
+                                page, total_torrents
+                            );
+                            ctx_clone.request_repaint();
+                        }
+                    } else {
+                        html_mirrors_to_query.lock().unwrap().push(mirror);
+                    }
+
+                    let mut active = active_threads.lock().unwrap();
+                    *active -= 1;
+                    ctx_clone.request_repaint();
+                });
+            }
+
+            loop {
+                if *search_cancelled_clone.lock().unwrap() {
+                    break;
+                }
+                let active = *active_threads.lock().unwrap();
+                if active == 0 {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            if *search_cancelled_clone.lock().unwrap() {
+                *is_searching_clone.lock().unwrap() = false;
+                *status_clone.lock().unwrap() = "Search stopped by user.".to_string();
+                ctx_clone.request_repaint();
+                return;
+            }
+
+            let html_mirrors = {
+                let list = html_mirrors_to_query.lock().unwrap();
+                list.clone()
+            };
+
+            if !html_mirrors.is_empty() {
+                let total_html = html_mirrors.len();
+                *status_clone.lock().unwrap() = format!(
+                    "Stage 2: Searching {} HTML fallbacks for page {}...",
+                    total_html, page
+                );
+                ctx_clone.request_repaint();
+
+                let active_html_threads = Arc::new(Mutex::new(total_html));
+
+                for mirror in html_mirrors {
+                    if *search_cancelled_clone.lock().unwrap() {
+                        break;
+                    }
+                    let query = query.clone();
+                    let results_clone = results_clone.clone();
+                    let status_clone = status_clone.clone();
+                    let ctx_clone = ctx_clone.clone();
+                    let active_html_threads = active_html_threads.clone();
+                    let search_cancelled_clone = search_cancelled_clone.clone();
+                    let mirror = mirror.clone();
+
+                    thread::spawn(move || {
+                        if *search_cancelled_clone.lock().unwrap() {
+                            let mut active = active_html_threads.lock().unwrap();
+                            *active -= 1;
+                            return;
+                        }
+
+                        let config = ureq::Agent::config_builder()
+                            .timeout_global(Some(std::time::Duration::from_secs(5)))
+                            .build();
+                        let agent: ureq::Agent = config.into();
+
+                        let parsed_movies = match search_source {
+                            SearchSource::Yify => {
+                                scrape_yts_html_fallback(&agent, &mirror, &query, page)
+                            }
+                            SearchSource::X1337 => {
+                                scrape_1337x_html_fallback(&agent, &mirror, &query)
+                            }
+                            SearchSource::SolidTorrents => {
+                                scrape_solidtorrents_api_page(&agent, &mirror, &query, page).0
+                            }
+                            SearchSource::ExtTo => scrape_ext_html_fallback(&agent, &mirror, &query),
+                        };
+
+                        if !parsed_movies.is_empty() && !*search_cancelled_clone.lock().unwrap() {
+                            let mut results = results_clone.lock().unwrap();
+                            merge_search_results(&mut results, parsed_movies);
+                            let total_torrents: usize =
+                                results.iter().map(|m| m.torrents.len()).sum();
+                            let mut status = status_clone.lock().unwrap();
+                            *status = format!(
+                                "Stage 2: Updating HTML results for page {} (found {} torrent options)...",
+                                page, total_torrents
+                            );
+                            ctx_clone.request_repaint();
+                        }
+
+                        let mut active = active_html_threads.lock().unwrap();
+                        *active -= 1;
+                        ctx_clone.request_repaint();
+                    });
+                }
+
+                loop {
+                    if *search_cancelled_clone.lock().unwrap() {
+                        break;
+                    }
+                    let active = *active_html_threads.lock().unwrap();
+                    if active == 0 {
+                        break;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+
+            *is_searching_clone.lock().unwrap() = false;
+            let mut status = status_clone.lock().unwrap();
+            if *search_cancelled_clone.lock().unwrap() {
+                *status = "Search stopped by user.".to_string();
+            } else {
+                let final_results = results_clone.lock().unwrap().len();
+                let total_pages = *total_pages_clone.lock().unwrap();
+                if final_results == 0 {
+                    *status = format!("No results found on page {} across any mirrors.", page);
+                } else if let Some(total_pages) = total_pages {
+                    *status = format!(
+                        "Search completed. Found {} matches on page {} of {}.",
+                        final_results, page, total_pages
+                    );
+                } else {
+                    *status = format!(
+                        "Search completed. Found {} matches on page {}.",
+                        final_results, page
+                    );
+                }
+            }
+            ctx_clone.request_repaint();
+        });
+    }
 }
 
 impl eframe::App for AppState {
@@ -3284,6 +3670,10 @@ impl eframe::App for AppState {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(message) = self.background_status_message.lock().unwrap().take() {
+            self.status_message = message;
+        }
+
         if (ctx.pixels_per_point() - self.ui_scale).abs() > f32::EPSILON {
             ctx.set_pixels_per_point(self.ui_scale);
         }
@@ -3401,67 +3791,8 @@ impl eframe::App for AppState {
         // Bottom Status / Controller Panel
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.add_space(8.0);
-            if self.active_tab == AppTab::Search {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Torrent / Magnet URL:").strong());
-                    let _text_edit = ui.add(
-                        egui::TextEdit::singleline(&mut self.new_movie_url)
-                            .hint_text("Paste magnet link OR torrent download URL...")
-                            .desired_width(400.0)
-                    );
-
-                    if ui.button("➕ Add Torrent").clicked() {
-                        let url = self.new_movie_url.trim().to_string();
-                        if !url.is_empty() {
-                            let hash = get_infohash(&url).unwrap_or_else(|| {
-                                let cleaned: String = url.chars()
-                                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
-                                    .collect();
-                                if cleaned.len() > 30 { cleaned[cleaned.len()-30..].to_string() } else { cleaned }
-                            });
-                            let dir_name = format!("torrent_{}", hash);
-                            let dest_dir = get_cache_dir().join(&dir_name);
-                            let _ = fs::create_dir_all(&dest_dir);
-
-                            let magnet_uri = get_magnet_uri(&url);
-
-                            let meta_path = dest_dir.join("metadata.json");
-                            let (film_title, year, source_label) =
-                                cache_movie_identity(&dest_dir, None);
-                            let display_title = match year {
-                                Some(year) => format!("{film_title} ({year})"),
-                                None => film_title.clone(),
-                            };
-                            let meta_json = serde_json::json!({
-                                "title": display_title,
-                                "url": magnet_uri,
-                                "film_title": film_title,
-                                "year": year,
-                                "source_label": source_label,
-                                "seeds": null,
-                                "peers": null,
-                            });
-                            if let Ok(content) = serde_json::to_string_pretty(&meta_json) {
-                                let _ = fs::write(&meta_path, content);
-                            }
-
-                            self.refresh();
-
-                            if let Some(pos) = self.movies.iter().position(|m| m.key == dir_name) {
-                                self.selected_idx = Some(pos);
-                            }
-
-                            self.new_movie_url.clear();
-                            self.status_message = "Added torrent to Cache Library. Click 'Start Torrent' to download!".to_string();
-                        } else {
-                            self.status_message = "Error: Torrent URL cannot be empty!".to_string();
-                        }
-                    }
-                });
-                ui.add_space(6.0);
-            }
             ui.horizontal(|ui| {
-	                ui.label(egui::RichText::new("Status:").weak());
+		                ui.label(egui::RichText::new("Status:").weak());
 	                ui.label(egui::RichText::new(&self.status_message).italics().color(egui::Color32::from_rgb(100, 200, 255)));
 	                ui.separator();
                     let active_summary = {
@@ -3515,7 +3846,11 @@ impl eframe::App for AppState {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("🔄 Refresh").clicked() {
                             self.refresh();
-                            refresh_cached_seeds_and_peers(get_cache_dir(), ctx.clone());
+                            refresh_cached_seeds_and_peers(
+                                get_cache_dir(),
+                                ctx.clone(),
+                                self.background_status_message.clone(),
+                            );
                             self.status_message = "Cache refreshed; updating seeds and leechers in background...".to_string();
                         }
                     });
@@ -3645,7 +3980,7 @@ impl eframe::App for AppState {
                              let suffix = if is_complete {
                                  " [Complete]".to_string()
                              } else {
-                                 format!(" [{:.2}%]", max_pct)
+                                 String::new()
                              };
                              let progress_text = group_sidebar_progress_text(group);
 
@@ -3959,7 +4294,10 @@ impl eframe::App for AppState {
                                         if self.search_source != source {
                                             self.search_results.lock().unwrap().clear();
                                             self.search_status.lock().unwrap().clear();
+                                            *self.search_total_pages.lock().unwrap() = None;
+                                            self.search_page = 1;
                                         }
+                                        self.search_manual_mode = false;
                                         self.search_source = source;
                                         self.mirror_checker_source = source;
                                         self.show_mirror_checker = false;
@@ -3967,10 +4305,89 @@ impl eframe::App for AppState {
                                         self.status_message = format!("Opened {} search dashboard", source.source_label());
                                     }
                                 }
+                                if ui.selectable_label(self.search_manual_mode, "Manual").clicked() {
+                                    self.search_manual_mode = true;
+                                    self.show_mirror_checker = false;
+                                    self.status_message = "Opened manual torrent add".to_string();
+                                }
                             });
                             ui.add_space(8.0);
 
-	                        ui.horizontal(|ui| {
+                            if self.search_manual_mode {
+                                ui.heading(
+                                    egui::RichText::new("➕ Manual Torrent / Magnet Add")
+                                        .font(egui::FontId::proportional(20.0))
+                                        .strong(),
+                                );
+                                ui.add_space(8.0);
+                                ui.label("Paste a magnet link or torrent download URL to add it directly to the library.");
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Torrent / Magnet URL:").strong());
+                                    let text_edit = ui.add(
+                                        egui::TextEdit::singleline(&mut self.new_movie_url)
+                                            .hint_text("Paste magnet link OR torrent download URL...")
+                                            .desired_width(500.0),
+                                    );
+                                    let enter_pressed = text_edit.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                                    if ui.button("➕ Add Torrent").clicked() || enter_pressed {
+                                        let url = self.new_movie_url.trim().to_string();
+                                        if !url.is_empty() {
+                                            let hash = get_infohash(&url).unwrap_or_else(|| {
+                                                let cleaned: String = url
+                                                    .chars()
+                                                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                                                    .collect();
+                                                if cleaned.len() > 30 {
+                                                    cleaned[cleaned.len() - 30..].to_string()
+                                                } else {
+                                                    cleaned
+                                                }
+                                            });
+                                            let dir_name = format!("torrent_{}", hash);
+                                            let dest_dir = get_cache_dir().join(&dir_name);
+                                            let _ = fs::create_dir_all(&dest_dir);
+
+                                            let magnet_uri = get_magnet_uri(&url);
+
+                                            let meta_path = dest_dir.join("metadata.json");
+                                            let (film_title, year, source_label) =
+                                                cache_movie_identity(&dest_dir, None);
+                                            let display_title = match year {
+                                                Some(year) => format!("{film_title} ({year})"),
+                                                None => film_title.clone(),
+                                            };
+                                            let meta_json = serde_json::json!({
+                                                "title": display_title,
+                                                "url": magnet_uri,
+                                                "source_url": if url.starts_with("magnet:") { String::new() } else { url.clone() },
+                                                "film_title": film_title,
+                                                "year": year,
+                                                "source_label": source_label,
+                                                "seeds": null,
+                                                "peers": null,
+                                            });
+                                            if let Ok(content) = serde_json::to_string_pretty(&meta_json) {
+                                                let _ = fs::write(&meta_path, content);
+                                            }
+
+                                            self.refresh();
+
+                                            if let Some(pos) = self.movies.iter().position(|m| m.key == dir_name) {
+                                                self.selected_idx = Some(pos);
+                                            }
+
+                                            self.new_movie_url.clear();
+                                            self.status_message = "Added torrent to Cache Library. Click 'Start Torrent' to download!".to_string();
+                                        } else {
+                                            self.status_message = "Error: Torrent URL cannot be empty!".to_string();
+                                        }
+                                    }
+                                });
+                            } else {
+		                        ui.horizontal(|ui| {
                             let search_input = ui.add(
                                 egui::TextEdit::singleline(&mut self.search_query)
                                     .hint_text("Type movie title (e.g. Inception)...")
@@ -3992,239 +4409,10 @@ impl eframe::App for AppState {
                                 }
                             } else {
 	                                if ui.button(self.search_source.search_button_label()).clicked() || enter_pressed {
-	                                    let query = self.search_query.trim().to_string();
-	                                    if !query.is_empty() {
-                                            let search_source = self.search_source;
-	                                        let results_clone = self.search_results.clone();
-                                        let is_searching_clone = self.is_searching.clone();
-                                        let status_clone = self.search_status.clone();
-                                        let search_cancelled_clone = self.search_cancelled.clone();
-                                        let ctx_clone = ctx.clone();
- 
-                                        *self.is_searching.lock().unwrap() = true;
-                                        *self.search_cancelled.lock().unwrap() = false;
-	                                        *self.search_status.lock().unwrap() = match search_source {
-                                                SearchSource::Yify => "Stage 1: Searching YIFY JSON APIs...".to_string(),
-                                                SearchSource::X1337 => "Searching 1337x HTML mirrors...".to_string(),
-                                                SearchSource::SolidTorrents => "Searching SolidTorrents APIs...".to_string(),
-                                                SearchSource::ExtTo => "Searching ext mirrors...".to_string(),
-                                            };
-                                        results_clone.lock().unwrap().clear();
-                                        
-                                        thread::spawn(move || {
-	                                            let mirrors = load_search_mirrors(search_source);
-	                                            if mirrors.is_empty() {
-	                                                *status_clone.lock().unwrap() = format!("Error: {} mirror list not found!", search_source.source_label());
-                                                *is_searching_clone.lock().unwrap() = false;
-                                                ctx_clone.request_repaint();
-                                                return;
-                                            }
- 
-                                            // --- STAGE 1: SEARCH ALL JSON MIRRORS ---
-                                            let total_mirrors = mirrors.len();
-                                            let active_threads = Arc::new(Mutex::new(total_mirrors));
-                                            let html_mirrors_to_query = Arc::new(Mutex::new(Vec::new()));
- 
-                                            for mirror in &mirrors {
-                                                if *search_cancelled_clone.lock().unwrap() {
-                                                    break;
-                                                }
-                                                let query = query.clone();
-                                                let results_clone = results_clone.clone();
-                                                let status_clone = status_clone.clone();
-                                                let ctx_clone = ctx_clone.clone();
-                                                let active_threads = active_threads.clone();
-                                                let html_mirrors_to_query = html_mirrors_to_query.clone();
-	                                                let search_cancelled_clone = search_cancelled_clone.clone();
-	                                                let mirror = mirror.clone();
-                                                    let search_source = search_source;
-	 
-	                                                thread::spawn(move || {
-                                                    if *search_cancelled_clone.lock().unwrap() {
-                                                        let mut active = active_threads.lock().unwrap();
-                                                        *active -= 1;
-                                                        return;
-                                                    }
- 
-                                                    let config = ureq::Agent::config_builder()
-                                                        .timeout_global(Some(std::time::Duration::from_secs(4)))
-                                                        .build();
-                                                    let agent: ureq::Agent = config.into();
- 
-	                                                    let mut parsed_movies = Vec::new();
-	                                                    let mut is_json_success = false;
-
-                                                    match search_source {
-                                                        SearchSource::Yify => {
-                                                            let encoded = percent_encode(&query);
-                                                            let url = format!("{}/api/v2/list_movies.json?query_term={}&limit=10", mirror.trim_end_matches('/'), encoded);
-                                                            let res = agent.get(&url)
-                                                                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                                                                .call();
-
-                                                            if let Ok(mut resp) = res {
-                                                                if let Ok(body) = resp.body_mut().read_to_string() {
-                                                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
-                                                                        if val["status"] == "ok" {
-                                                                            if let Some(movies_arr) = val["data"]["movies"].as_array() {
-                                                                                for m_val in movies_arr {
-                                                                                    if let Ok(movie) = serde_json::from_value::<YtsMovie>(m_val.clone()) {
-                                                                                        parsed_movies.push(movie);
-                                                                                    }
-                                                                                }
-                                                                                is_json_success = true;
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        SearchSource::SolidTorrents => {
-                                                            parsed_movies = scrape_solidtorrents_api(&agent, &mirror, &query);
-                                                            is_json_success = true;
-                                                        }
-                                                        SearchSource::ExtTo => {
-                                                            parsed_movies = scrape_ext_api(&agent, &mirror, &query);
-                                                            is_json_success = !parsed_movies.is_empty();
-                                                        }
-                                                        SearchSource::X1337 => {
-                                                            html_mirrors_to_query.lock().unwrap().push(mirror);
-                                                            let mut active = active_threads.lock().unwrap();
-                                                            *active -= 1;
-                                                            ctx_clone.request_repaint();
-                                                            return;
-                                                        }
-                                                    }
- 
-	                                                    if is_json_success {
-	                                                        if !parsed_movies.is_empty() && !*search_cancelled_clone.lock().unwrap() {
-	                                                            let mut results = results_clone.lock().unwrap();
-                                                                merge_search_results(&mut results, parsed_movies);
-	                                                            let total_torrents: usize = results.iter().map(|m| m.torrents.len()).sum();
-	                                                            let mut status = status_clone.lock().unwrap();
-	                                                            *status = format!("Stage 1: Updating JSON results (found {} torrent options)...", total_torrents);
-                                                            ctx_clone.request_repaint();
-                                                        }
-                                                    } else {
-                                                        html_mirrors_to_query.lock().unwrap().push(mirror);
-                                                    }
- 
-                                                    let mut active = active_threads.lock().unwrap();
-                                                    *active -= 1;
-                                                    ctx_clone.request_repaint();
-                                                });
-                                            }
- 
-                                            // Wait for JSON stage to finish
-                                            loop {
-                                                if *search_cancelled_clone.lock().unwrap() {
-                                                    break;
-                                                }
-                                                let active = *active_threads.lock().unwrap();
-                                                if active == 0 {
-                                                    break;
-                                                }
-                                                thread::sleep(std::time::Duration::from_millis(50));
-                                            }
- 
-                                            if *search_cancelled_clone.lock().unwrap() {
-                                                *is_searching_clone.lock().unwrap() = false;
-                                                *status_clone.lock().unwrap() = "Search stopped by user.".to_string();
-                                                ctx_clone.request_repaint();
-                                                return;
-                                            }
- 
-                                            // --- STAGE 2: SEARCH ALL HTML FALLBACK MIRRORS ---
-                                            let html_mirrors = {
-                                                let list = html_mirrors_to_query.lock().unwrap();
-                                                list.clone()
-                                            };
- 
-                                            if !html_mirrors.is_empty() {
-                                                let total_html = html_mirrors.len();
-                                                *status_clone.lock().unwrap() = format!("Stage 2: Searching {} HTML fallbacks...", total_html);
-                                                ctx_clone.request_repaint();
- 
-                                                let active_html_threads = Arc::new(Mutex::new(total_html));
- 
-                                                for mirror in html_mirrors {
-                                                    if *search_cancelled_clone.lock().unwrap() {
-                                                        break;
-                                                    }
-                                                    let query = query.clone();
-                                                    let results_clone = results_clone.clone();
-                                                    let status_clone = status_clone.clone();
-                                                    let ctx_clone = ctx_clone.clone();
-                                                    let active_html_threads = active_html_threads.clone();
-	                                                let search_cancelled_clone = search_cancelled_clone.clone();
-	                                                let mirror = mirror.clone();
-                                                    let search_source = search_source;
-	 
-	                                                thread::spawn(move || {
-                                                        if *search_cancelled_clone.lock().unwrap() {
-                                                            let mut active = active_html_threads.lock().unwrap();
-                                                            *active -= 1;
-                                                            return;
-                                                        }
- 
-                                                        let config = ureq::Agent::config_builder()
-                                                            .timeout_global(Some(std::time::Duration::from_secs(5)))
-                                                            .build();
-                                                        let agent: ureq::Agent = config.into();
- 
-	                                                        let parsed_movies = match search_source {
-                                                                SearchSource::Yify => scrape_yts_html_fallback(&agent, &mirror, &query),
-                                                                SearchSource::X1337 => scrape_1337x_html_fallback(&agent, &mirror, &query),
-                                                                SearchSource::SolidTorrents => scrape_solidtorrents_api(&agent, &mirror, &query),
-                                                                SearchSource::ExtTo => scrape_ext_html_fallback(&agent, &mirror, &query),
-                                                            };
- 
-	                                                        if !parsed_movies.is_empty() && !*search_cancelled_clone.lock().unwrap() {
-	                                                            let mut results = results_clone.lock().unwrap();
-                                                                merge_search_results(&mut results, parsed_movies);
-	                                                            let total_torrents: usize = results.iter().map(|m| m.torrents.len()).sum();
-	                                                            let mut status = status_clone.lock().unwrap();
-	                                                            *status = format!("Stage 2: Updating HTML results (found {} torrent options)...", total_torrents);
-                                                            ctx_clone.request_repaint();
-                                                        }
- 
-                                                        let mut active = active_html_threads.lock().unwrap();
-                                                        *active -= 1;
-                                                        ctx_clone.request_repaint();
-                                                    });
-                                                }
- 
-                                                // Wait for HTML stage to finish
-                                                loop {
-                                                    if *search_cancelled_clone.lock().unwrap() {
-                                                        break;
-                                                    }
-                                                    let active = *active_html_threads.lock().unwrap();
-                                                    if active == 0 {
-                                                        break;
-                                                    }
-                                                    thread::sleep(std::time::Duration::from_millis(50));
-                                                }
-                                            }
- 
-                                            *is_searching_clone.lock().unwrap() = false;
-                                            let mut status = status_clone.lock().unwrap();
-                                            if *search_cancelled_clone.lock().unwrap() {
-                                                *status = "Search stopped by user.".to_string();
-                                            } else {
-                                                let final_results = results_clone.lock().unwrap().len();
-                                                if final_results == 0 {
-                                                    *status = "No results found across any mirrors.".to_string();
-                                                } else {
-                                                    *status = format!("Search completed. Found {} matches.", final_results);
-                                                }
-                                            }
-                                            ctx_clone.request_repaint();
-                                        });
+                                        self.start_search_page(ctx, 1);
                                     }
-                                }
                             }
- 
+
                             if ui.button("🌐 Mirror Status Checker").clicked() {
                                 self.show_mirror_checker = true;
                             }
@@ -4241,6 +4429,62 @@ impl eframe::App for AppState {
                             ui.label(egui::RichText::new(&status_msg).italics().color(egui::Color32::from_rgb(180, 180, 200)));
                             ui.add_space(6.0);
                         }
+
+                        if self.search_source.supports_pagination() {
+                            let total_pages = *self.search_total_pages.lock().unwrap();
+                            let can_go_prev = !is_searching && self.search_page > 1;
+                            let can_go_next = !is_searching
+                                && total_pages.map(|tp| self.search_page < tp).unwrap_or(true)
+                                && !self.search_query.trim().is_empty();
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Page {}", self.search_page));
+                                if ui
+                                    .add_enabled(can_go_prev, egui::Button::new("◀ Prev"))
+                                    .clicked()
+                                {
+                                    self.start_search_page(ctx, self.search_page.saturating_sub(1));
+                                }
+
+                                let total_pages_for_buttons = total_pages.unwrap_or(self.search_page).max(1);
+                                let start_page = self.search_page.saturating_sub(2).max(1);
+                                let end_page = total_pages_for_buttons.min(start_page + 4);
+                                for page_num in start_page..=end_page {
+                                    if ui
+                                        .selectable_label(self.search_page == page_num, page_num.to_string())
+                                        .clicked()
+                                        && !is_searching
+                                        && page_num != self.search_page
+                                    {
+                                        self.start_search_page(ctx, page_num);
+                                    }
+                                }
+
+                                if let Some(total_pages) = total_pages {
+                                    if end_page < total_pages {
+                                        ui.label("...");
+                                        if ui
+                                            .selectable_label(
+                                                self.search_page == total_pages,
+                                                total_pages.to_string(),
+                                            )
+                                            .clicked()
+                                            && !is_searching
+                                        {
+                                            self.start_search_page(ctx, total_pages);
+                                        }
+                                    }
+                                }
+
+                                if ui
+                                    .add_enabled(can_go_next, egui::Button::new("Next ▶"))
+                                    .clicked()
+                                {
+                                    self.start_search_page(ctx, self.search_page + 1);
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+                            }
 
                         // Render search results scroll area
                         let results = self.search_results.lock().unwrap().clone();
@@ -4474,13 +4718,15 @@ impl PanelRenderHelper for AppState {
                 let map = self.torrent_status.lock().unwrap();
                 map.get(&torrent.dir_name).map(|s| s.active).unwrap_or(false)
             };
+            let root_has_cache_artifacts = has_local_cache_artifacts(&parent_cache_path);
             let root_hash = torrent.dir_name.strip_prefix("torrent_").map(|hash| hash.to_uppercase());
             let torrent_options = torrent
                 .metadata
                 .as_ref()
                 .and_then(|meta| meta.torrent_options.clone());
             let has_torrent_options = torrent_options.as_ref().is_some_and(|options| !options.is_empty());
-            let root_has_local_status = root_has_torrent || root_media.is_some() || root_is_active;
+            let root_has_local_status =
+                root_has_torrent || root_media.is_some() || root_is_active || root_has_cache_artifacts;
             if root_has_local_status && !has_torrent_options {
                 ui.label(egui::RichText::new("Quality Options Local Status:").strong());
                 ui.add_space(6.0);
@@ -4824,18 +5070,24 @@ impl PanelRenderHelper for AppState {
                         let quality_path = parent_cache_path.join(&opt.quality);
                         let local_media = find_media_file(&quality_path);
                         let has_torrent = quality_path.join("movie.torrent").exists();
+                        let has_cache_artifacts = has_local_cache_artifacts(&quality_path);
                         let hash = opt.hash.to_uppercase();
                         let is_active = {
                             let map = self.torrent_status.lock().unwrap();
                             map.get(&hash).map(|s| s.active).unwrap_or(false)
                         };
-                        (!is_active, !(has_torrent || local_media.is_some()), opt.quality.clone())
+                        (
+                            !is_active,
+                            !(has_torrent || local_media.is_some() || has_cache_artifacts),
+                            opt.quality.clone(),
+                        )
                     });
 
                     for opt in options {
                         let quality_path = parent_cache_path.join(&opt.quality);
                         let local_media = find_media_file(&quality_path);
                         let has_torrent = quality_path.join("movie.torrent").exists();
+                        let has_cache_artifacts = has_local_cache_artifacts(&quality_path);
                         let hash = opt.hash.to_uppercase();
                         let is_active = {
                             let map = self.torrent_status.lock().unwrap();
@@ -4887,7 +5139,7 @@ impl PanelRenderHelper for AppState {
                                     });
                                 }
 
-                                if has_torrent || local_media.is_some() || is_active {
+                                if has_torrent || local_media.is_some() || is_active || has_cache_artifacts {
                                     ui.horizontal(|ui| {
                                         ui.label(egui::RichText::new("Subfolder Path:").strong());
                                         ui.label(format!(
