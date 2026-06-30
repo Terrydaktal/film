@@ -305,6 +305,16 @@ fn format_live_torrent_status(
     }
 }
 
+fn downloaded_text_is_zero(downloaded: &str) -> bool {
+    let first_part = downloaded.split('/').next().unwrap_or(downloaded).trim();
+    parse_size_to_bytes(first_part) == Some(0)
+}
+
+fn peers_text_is_zeroish(peers: &str) -> bool {
+    let trimmed = peers.trim().to_ascii_lowercase();
+    matches!(trimmed.as_str(), "" | "0" | "0/0" | "0 peers" | "0 peer")
+}
+
 fn is_webtorrent_seeding_line(line: &str) -> bool {
     line.trim_start().starts_with("Seeding:")
 }
@@ -369,11 +379,17 @@ where
                     .split("from")
                     .nth(1)
                     .map(|part| part.trim().to_string())
-                    .unwrap_or_else(|| "0 peers".to_string());
+                    .unwrap_or_else(|| "connecting".to_string());
                 let mut map = status_map.lock().unwrap();
                 if let Some(s) = map.get_mut(&status_key) {
                     s.speed = "Fetching metadata".to_string();
-                    s.peers = peer_text;
+                    if peer_text.starts_with('0') || peer_text.eq_ignore_ascii_case("0 peers") {
+                        if s.peers.trim().is_empty() || s.peers == "connecting" {
+                            s.peers = "connecting".to_string();
+                        }
+                    } else {
+                        s.peers = peer_text;
+                    }
                 }
                 ctx.request_repaint();
                 continue;
@@ -385,14 +401,38 @@ where
                 }
                 let mut map = status_map.lock().unwrap();
                 if let Some(s) = map.get_mut(&status_key) {
+                    let incoming_downloaded = update
+                        .downloaded
+                        .as_deref()
+                        .unwrap_or(&s.downloaded);
+                    let zero_download = downloaded_text_is_zero(incoming_downloaded);
+                    let incoming_peers = update.peers.as_deref().unwrap_or(&s.peers);
+                    let zeroish_peers = peers_text_is_zeroish(incoming_peers);
                     if let Some(speed) = update.speed {
-                        s.speed = speed;
+                        if !(zero_download
+                            && zeroish_peers
+                            && speed.trim().eq_ignore_ascii_case("0 B/s"))
+                        {
+                            s.speed = speed;
+                        } else if s.speed.trim().is_empty() {
+                            s.speed = "Connecting...".to_string();
+                        }
                     }
                     if let Some(downloaded) = update.downloaded {
                         s.downloaded = downloaded;
                     }
                     if let Some(peers) = update.peers {
-                        s.peers = peers;
+                        if zero_download && peers_text_is_zeroish(&peers) {
+                            s.peers = "connecting".to_string();
+                            if matches!(
+                                s.speed.trim(),
+                                "" | "Connecting..." | "Waiting for peers..." | "Fetching metadata"
+                            ) {
+                                s.speed = "Waiting for peers...".to_string();
+                            }
+                        } else {
+                            s.peers = peers;
+                        }
                     }
                 }
                 ctx.request_repaint();
@@ -855,7 +895,15 @@ fn get_folder_disk_space(dir: &std::path::Path) -> u64 {
                     visit(&path, total);
                 } else if path.is_file() {
                     if let Ok(meta) = path.metadata() {
-                        *total += meta.len();
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            *total += meta.blocks().saturating_mul(512);
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            *total += meta.len();
+                        }
                     }
                 }
             }
@@ -4984,30 +5032,40 @@ impl PanelRenderHelper for AppState {
                                         cmd.stdout(std::process::Stdio::piped());
                                         cmd.stderr(std::process::Stdio::piped());
 
-	                                        let spawn_res = cmd.spawn();
-	                                        if let Ok(mut child) = spawn_res {
-	                                            let _child_pid = child.id();
-	                                            if let Some(stderr) = child.stderr.take() {
-	                                                spawn_webtorrent_output_reader(
-	                                                    stderr,
-	                                                    "WEBTORRENT ERR",
-	                                                    torrent_status_clone.clone(),
-	                                                    dir_to_play.clone(),
-	                                                    dest_dir.clone(),
-	                                                    ctx_clone.clone(),
-	                                                );
+	                                        match cmd.spawn() {
+	                                            Ok(mut child) => {
+	                                                let _child_pid = child.id();
+	                                                if let Some(stderr) = child.stderr.take() {
+	                                                    spawn_webtorrent_output_reader(
+	                                                        stderr,
+	                                                        "WEBTORRENT ERR",
+	                                                        torrent_status_clone.clone(),
+	                                                        dir_to_play.clone(),
+	                                                        dest_dir.clone(),
+	                                                        ctx_clone.clone(),
+	                                                    );
+	                                                }
+	                                                if let Some(stdout) = child.stdout.take() {
+	                                                    spawn_webtorrent_output_reader(
+	                                                        stdout,
+	                                                        "WEBTORRENT",
+	                                                        torrent_status_clone.clone(),
+	                                                        dir_to_play.clone(),
+	                                                        dest_dir.clone(),
+	                                                        ctx_clone.clone(),
+	                                                    );
+	                                                }
+	                                                children.push(child);
 	                                            }
-	                                            if let Some(stdout) = child.stdout.take() {
-	                                                spawn_webtorrent_output_reader(
-	                                                    stdout,
-	                                                    "WEBTORRENT",
-	                                                    torrent_status_clone.clone(),
-	                                                    dir_to_play.clone(),
-	                                                    dest_dir.clone(),
-	                                                    ctx_clone.clone(),
-	                                                );
+	                                            Err(err) => {
+	                                                let mut map = torrent_status_clone.lock().unwrap();
+	                                                if let Some(s) = map.get_mut(&dir_to_play) {
+	                                                    s.active = false;
+	                                                    s.speed = "Error".to_string();
+	                                                    s.peers = err.to_string();
+	                                                }
+	                                                ctx_clone.request_repaint();
 	                                            }
-	                                            children.push(child);
 	                                        }
                                     });
                                     self.status_message = "Starting torrent download...".to_string();
@@ -5368,31 +5426,42 @@ impl PanelRenderHelper for AppState {
                                                 cmd.stdout(std::process::Stdio::piped());
                                                 cmd.stderr(std::process::Stdio::piped());
 
-                                                if let Ok(mut child) = cmd.spawn() {
-                                                    let _child_pid = child.id();
-                                                    if let Some(stderr) = child.stderr.take() {
-                                                        spawn_webtorrent_output_reader(
-                                                            stderr,
-                                                            "WEBTORRENT ERR",
-                                                            torrent_status_clone.clone(),
-                                                            hash_clone.clone(),
-                                                            dest_dir.clone(),
-                                                            ctx_clone.clone(),
-                                                        );
-                                                    }
-                                                    if let Some(stdout) = child.stdout.take() {
-                                                        spawn_webtorrent_output_reader(
-                                                            stdout,
-                                                            "WEBTORRENT",
-                                                            torrent_status_clone.clone(),
-                                                            hash_clone.clone(),
-                                                            dest_dir.clone(),
-                                                            ctx_clone.clone(),
-                                                        );
-                                                    }
-                                                    children.push(child);
-                                                }
-                                            });
+	                                                match cmd.spawn() {
+	                                                    Ok(mut child) => {
+	                                                        let _child_pid = child.id();
+	                                                        if let Some(stderr) = child.stderr.take() {
+	                                                            spawn_webtorrent_output_reader(
+	                                                                stderr,
+	                                                                "WEBTORRENT ERR",
+	                                                                torrent_status_clone.clone(),
+	                                                                hash_clone.clone(),
+	                                                                dest_dir.clone(),
+	                                                                ctx_clone.clone(),
+	                                                            );
+	                                                        }
+	                                                        if let Some(stdout) = child.stdout.take() {
+	                                                            spawn_webtorrent_output_reader(
+	                                                                stdout,
+	                                                                "WEBTORRENT",
+	                                                                torrent_status_clone.clone(),
+	                                                                hash_clone.clone(),
+	                                                                dest_dir.clone(),
+	                                                                ctx_clone.clone(),
+	                                                            );
+	                                                        }
+	                                                        children.push(child);
+	                                                    }
+	                                                    Err(err) => {
+	                                                        let mut map = torrent_status_clone.lock().unwrap();
+	                                                        if let Some(s) = map.get_mut(&hash_clone) {
+	                                                            s.active = false;
+	                                                            s.speed = "Error".to_string();
+	                                                            s.peers = err.to_string();
+	                                                        }
+	                                                        ctx_clone.request_repaint();
+	                                                    }
+	                                                }
+	                                            });
                                             self.status_message = format!(
                                                 "Starting {} torrent download...",
                                                 opt.quality
