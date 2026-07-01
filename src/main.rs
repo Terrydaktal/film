@@ -374,6 +374,53 @@ fn libtorrent_worker_path() -> PathBuf {
         .join("tools/libtorrent_worker.py")
 }
 
+fn build_libtorrent_worker_command(
+    source: &str,
+    save_path: &str,
+    display_name: &str,
+    sequential: bool,
+) -> Command {
+    let worker_path = libtorrent_worker_path();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let venv_python = cwd.join(".venv").join("bin").join("python");
+    let home_uv = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".local").join("bin").join("uv"));
+
+    let mut cmd = if venv_python.exists() {
+        let mut cmd = Command::new(venv_python);
+        cmd.arg(worker_path);
+        cmd
+    } else if let Some(home_uv) = home_uv.filter(|path| path.exists()) {
+        let mut cmd = Command::new(home_uv);
+        cmd.env("UV_CACHE_DIR", "/data/.cache/uv");
+        cmd.args(["run", "python"]);
+        cmd.arg(worker_path);
+        cmd
+    } else {
+        let mut cmd = Command::new("uv");
+        cmd.env("UV_CACHE_DIR", "/data/.cache/uv");
+        cmd.args(["run", "python"]);
+        cmd.arg(worker_path);
+        cmd
+    };
+
+    cmd.args([
+        "--source",
+        source,
+        "--save-path",
+        save_path,
+        "--display-name",
+        display_name,
+    ]);
+    if sequential {
+        cmd.arg("--sequential");
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd
+}
+
 fn kill_managed_torrent_processes() {
     let _ = Command::new("pkill")
         .args(["-9", "-i", "-f", "webtorrent"])
@@ -384,6 +431,21 @@ fn kill_managed_torrent_processes() {
     let _ = Command::new("pkill")
         .args(["-9", "-i", "-f", "libtorrent_worker.py"])
         .status();
+}
+
+fn delete_dir_with_retries(dir_path: &std::path::Path) -> std::io::Result<()> {
+    let mut last_err = None;
+    for _ in 0..10 {
+        match fs::remove_dir_all(dir_path) {
+            Ok(()) => return Ok(()),
+            Err(_err) if !dir_path.exists() => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(150));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("failed to delete directory")))
 }
 
 fn mark_torrent_complete(
@@ -4824,18 +4886,31 @@ impl eframe::App for AppState {
                                 let mut children = self.spawned_children.lock().unwrap();
                                 for child in children.iter_mut() {
                                     let _ = child.kill();
+                                    let _ = child.wait();
                                 }
                                 children.clear();
                             }
                             kill_managed_torrent_processes();
                             self.torrent_status.lock().unwrap().clear();
-                            if dir_path.exists() {
-                                let _ = fs::remove_dir_all(&dir_path);
+                            let delete_result = if dir_path.exists() {
+                                delete_dir_with_retries(&dir_path)
+                            } else {
+                                Ok(())
+                            };
+                            if delete_result.is_ok() && !dir_path.exists() {
+                                self.pending_delete_dir = None;
+                                self.selected_idx = None;
+                                self.refresh();
+                                self.status_message = "Deleted film library item.".to_string();
+                            } else {
+                                self.status_message = format!(
+                                    "Failed to delete film library item on first attempt: {}",
+                                    delete_result
+                                        .err()
+                                        .map(|err| err.to_string())
+                                        .unwrap_or_else(|| "directory still exists".to_string())
+                                );
                             }
-                            self.pending_delete_dir = None;
-                            self.selected_idx = None;
-                            self.refresh();
-                            self.status_message = "Deleted film library item.".to_string();
                         }
                     });
                 });
@@ -6171,24 +6246,12 @@ impl PanelRenderHelper for AppState {
 	                                            torrent_status_clone.clone(),
 	                                        );
 
-		                                        let mut cmd = Command::new("uv");
-		                                        cmd.env("UV_CACHE_DIR", "/data/.cache/uv");
-		                                        cmd.args([
-                                                    "run",
-                                                    "python",
-                                                    libtorrent_worker_path().to_string_lossy().as_ref(),
-                                                    "--source",
+		                                        let mut cmd = build_libtorrent_worker_command(
                                                     torrent_source.as_str(),
-                                                    "--save-path",
                                                     dest.as_str(),
-                                                    "--display-name",
                                                     "Movie",
-                                                ]);
-                                                if sequential_mode {
-		                                            cmd.arg("--sequential");
-                                                }
-	                                        cmd.stdout(std::process::Stdio::piped());
-	                                        cmd.stderr(std::process::Stdio::piped());
+                                                    sequential_mode,
+                                                );
 
 			                                        match cmd.spawn() {
 			                                            Ok(mut child) => {
@@ -6661,24 +6724,12 @@ impl PanelRenderHelper for AppState {
                                                     torrent_status_clone.clone(),
                                                 );
 
-                                                let mut cmd = Command::new("uv");
-                                                cmd.env("UV_CACHE_DIR", "/data/.cache/uv");
-                                                cmd.args([
-                                                    "run",
-                                                    "python",
-                                                    libtorrent_worker_path().to_string_lossy().as_ref(),
-                                                    "--source",
+                                                let mut cmd = build_libtorrent_worker_command(
                                                     torrent_source.as_str(),
-                                                    "--save-path",
                                                     dest.as_str(),
-                                                    "--display-name",
                                                     title_for_launch.as_str(),
-                                                ]);
-                                                if sequential_mode {
-                                                    cmd.arg("--sequential");
-                                                }
-                                                cmd.stdout(std::process::Stdio::piped());
-                                                cmd.stderr(std::process::Stdio::piped());
+                                                    sequential_mode,
+                                                );
 
 			                                                match cmd.spawn() {
 			                                                    Ok(mut child) => {
