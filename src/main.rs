@@ -2283,6 +2283,8 @@ struct YtsMovie {
     rating: Option<f32>,
     genres: Option<Vec<String>>,
     runtime: Option<u32>,
+    #[serde(default, alias = "date_uploaded")]
+    uploaded_at: Option<String>,
     #[serde(default)]
     media_kind: MediaKind,
     torrents: Vec<YtsTorrent>,
@@ -2305,12 +2307,21 @@ struct MirrorSearchReport {
     failed: Vec<MirrorSearchReportEntry>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SearchSource {
     Yify,
     X1337,
     SolidTorrents,
     ExtTo,
+}
+
+#[derive(Clone, Default)]
+struct SearchStateSnapshot {
+    query: String,
+    results: Vec<YtsMovie>,
+    page: usize,
+    total_pages: Option<usize>,
+    status: String,
 }
 
 impl SearchSource {
@@ -2588,7 +2599,11 @@ fn scrape_yify_api_page(
     let mut parsed_movies = Vec::new();
     if let Some(movies_arr) = val["data"]["movies"].as_array() {
         for m_val in movies_arr {
-            if let Ok(movie) = serde_json::from_value::<YtsMovie>(m_val.clone()) {
+            if let Ok(mut movie) = serde_json::from_value::<YtsMovie>(m_val.clone()) {
+                movie.uploaded_at = movie
+                    .uploaded_at
+                    .as_deref()
+                    .and_then(compact_uploaded_date);
                 parsed_movies.push(movie);
             }
         }
@@ -2855,6 +2870,7 @@ fn scrape_yts_html_fallback(
                                 rating,
                                 genres: None,
                                 runtime: None,
+                                uploaded_at: None,
                                 media_kind,
                                 torrents,
                             });
@@ -2946,22 +2962,116 @@ fn solidtorrents_size_string(value: &serde_json::Value) -> String {
     "Unknown".to_string()
 }
 
+fn compact_uploaded_date(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.len() >= 10 {
+        Some(trimmed[..10].to_string())
+    } else if !trimmed.is_empty() {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn month_number_from_name(value: &str) -> Option<u32> {
+    match value.trim_matches('.').to_ascii_lowercase().as_str() {
+        "jan" | "january" => Some(1),
+        "feb" | "february" => Some(2),
+        "mar" | "march" => Some(3),
+        "apr" | "april" => Some(4),
+        "may" => Some(5),
+        "jun" | "june" => Some(6),
+        "jul" | "july" => Some(7),
+        "aug" | "august" => Some(8),
+        "sep" | "sept" | "september" => Some(9),
+        "oct" | "october" => Some(10),
+        "nov" | "november" => Some(11),
+        "dec" | "december" => Some(12),
+        _ => None,
+    }
+}
+
+fn normalize_1337x_uploaded_date(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(lower.as_str(), "today" | "y-day" | "yesterday") {
+        return Some(trimmed.to_string());
+    }
+    if trimmed.len() >= 10
+        && trimmed.as_bytes().get(4) == Some(&b'-')
+        && trimmed.as_bytes().get(7) == Some(&b'-')
+    {
+        return Some(trimmed[..10].to_string());
+    }
+
+    let cleaned = trimmed.replace(',', " ");
+    let tokens: Vec<&str> = cleaned.split_whitespace().collect();
+    if tokens.len() < 3 {
+        return None;
+    }
+
+    let month = month_number_from_name(tokens[0])?;
+    let day_digits: String = tokens[1]
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    let year_digits: String = tokens[2]
+        .trim_start_matches('\'')
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+
+    let day = day_digits.parse::<u32>().ok()?;
+    let year = match year_digits.len() {
+        4 => year_digits.parse::<u32>().ok()?,
+        2 => 2000 + year_digits.parse::<u32>().ok()?,
+        _ => return Some(trimmed.to_string()),
+    };
+
+    Some(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn extract_1337x_uploaded_date(row: &str) -> Option<String> {
+    extract_text_from_row_class(row, "coll-4")
+        .or_else(|| extract_text_from_row_class(row, "coll-5"))
+        .or_else(|| extract_text_from_row_class(row, "time"))
+        .and_then(|text| normalize_1337x_uploaded_date(&text))
+        .or_else(|| {
+            row.split("<td")
+                .skip(1)
+                .filter_map(|cell| {
+                    let cell_end = cell.find("</td>")?;
+                    let start = cell.find('>')? + 1;
+                    let text = strip_html_tags(&cell[start..cell_end]);
+                    normalize_1337x_uploaded_date(text.trim())
+                })
+                .next()
+        })
+}
+
 fn scrape_solidtorrents_api_page(
     agent: &ureq::Agent,
     mirror: &str,
     query: &str,
     page: usize,
+    sort_by_date: bool,
 ) -> (Vec<YtsMovie>, Option<usize>) {
     let encoded = percent_encode(query);
     let page = page.max(1);
     let per_page = SearchSource::SolidTorrents.page_size();
-    let url = format!(
+    let mut url = format!(
         "{}/api/v1/search?q={}&limit={}&page={}",
         mirror.trim_end_matches('/'),
         encoded,
         per_page,
         page
     );
+    if sort_by_date {
+        url.push_str("&sort=date");
+    }
     let res = agent
         .get(&url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -3014,6 +3124,9 @@ fn scrape_solidtorrents_api_page(
                 .or_else(|| item["peers"].as_u64())
                 .map(|v| v as u32);
             let size = solidtorrents_size_string(&item["size"]);
+            let uploaded_at = item["createdAt"]
+                .as_str()
+                .and_then(compact_uploaded_date);
 
             let movie_torrents = vec![YtsTorrent {
                 url: make_magnet_link(&clean_hash, title),
@@ -3034,6 +3147,7 @@ fn scrape_solidtorrents_api_page(
                 rating: None,
                 genres: None,
                 runtime: None,
+                uploaded_at,
                 media_kind,
                 torrents: movie_torrents,
             });
@@ -3205,6 +3319,7 @@ fn scrape_ext_api(agent: &ureq::Agent, mirror: &str, query: &str) -> Vec<YtsMovi
                 rating: None,
                 genres: None,
                 runtime: None,
+                uploaded_at: None,
                 media_kind,
                 torrents: movie_torrents,
             });
@@ -3308,6 +3423,7 @@ fn scrape_ext_html_fallback(agent: &ureq::Agent, mirror: &str, query: &str) -> V
             rating: None,
             genres: None,
             runtime: None,
+            uploaded_at: None,
             media_kind,
             torrents: movie_torrents,
         });
@@ -3365,6 +3481,7 @@ fn scrape_1337x_html_fallback(agent: &ureq::Agent, mirror: &str, query: &str) ->
         let seeds = extract_table_number(row, "coll-2");
         let peers = extract_table_number(row, "coll-3");
         let size = extract_size_from_row(row).unwrap_or_else(|| "Unknown".to_string());
+        let uploaded_at = extract_1337x_uploaded_date(row);
 
         let mut magnet = String::new();
         let mut clean_hash = String::new();
@@ -3420,6 +3537,7 @@ fn scrape_1337x_html_fallback(agent: &ureq::Agent, mirror: &str, query: &str) ->
             rating: None,
             genres: None,
             runtime: None,
+            uploaded_at,
             media_kind,
             torrents: movie_torrents,
         });
@@ -3449,6 +3567,21 @@ fn extract_size_from_row(row: &str) -> Option<String> {
     }
 }
 
+fn extract_text_from_row_class(row: &str, class_name: &str) -> Option<String> {
+    let needle = format!("class=\"{}\"", class_name);
+    let pos = row.find(&needle)?;
+    let rest = &row[pos..];
+    let start = rest.find('>')? + 1;
+    let end = rest[start..].find('<')?;
+    let text = strip_html_tags(&rest[start..start + end]);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn merge_search_results(results: &mut Vec<YtsMovie>, new_movies: Vec<YtsMovie>) {
     for movie in new_movies {
         if let Some(existing_movie) = results
@@ -3457,6 +3590,9 @@ fn merge_search_results(results: &mut Vec<YtsMovie>, new_movies: Vec<YtsMovie>) 
         {
             existing_movie.media_kind =
                 merge_media_kind(existing_movie.media_kind, movie.media_kind);
+            if existing_movie.uploaded_at.is_none() {
+                existing_movie.uploaded_at = movie.uploaded_at.clone();
+            }
             for t in movie.torrents {
                 if let Some(existing_t) = existing_movie
                     .torrents
@@ -4225,6 +4361,8 @@ struct AppState {
     is_searching: Arc<Mutex<bool>>,
     search_status: Arc<Mutex<String>>,
     search_cancelled: Arc<Mutex<bool>>,
+    search_state_cache: HashMap<SearchSource, SearchStateSnapshot>,
+    solidtorrents_sort_by_date: bool,
     search_source: SearchSource,
     search_manual_mode: bool,
 
@@ -4272,6 +4410,8 @@ impl AppState {
             is_searching: Arc::new(Mutex::new(false)),
             search_status: Arc::new(Mutex::new(String::new())),
             search_cancelled: Arc::new(Mutex::new(false)),
+            search_state_cache: HashMap::new(),
+            solidtorrents_sort_by_date: false,
             search_source: SearchSource::Yify,
             search_manual_mode: false,
             show_mirror_checker: false,
@@ -4299,6 +4439,33 @@ impl AppState {
         }
     }
 
+    fn save_current_search_state(&mut self) {
+        let snapshot = SearchStateSnapshot {
+            query: self.search_query.clone(),
+            results: self.search_results.lock().unwrap().clone(),
+            page: self.search_page,
+            total_pages: *self.search_total_pages.lock().unwrap(),
+            status: self.search_status.lock().unwrap().clone(),
+        };
+        self.search_state_cache.insert(self.search_source, snapshot);
+    }
+
+    fn load_search_state(&mut self, source: SearchSource) {
+        if let Some(snapshot) = self.search_state_cache.get(&source).cloned() {
+            self.search_query = snapshot.query;
+            *self.search_results.lock().unwrap() = snapshot.results;
+            self.search_page = snapshot.page.max(1);
+            *self.search_total_pages.lock().unwrap() = snapshot.total_pages;
+            *self.search_status.lock().unwrap() = snapshot.status;
+        } else {
+            self.search_query.clear();
+            self.search_results.lock().unwrap().clear();
+            self.search_page = 1;
+            *self.search_total_pages.lock().unwrap() = None;
+            self.search_status.lock().unwrap().clear();
+        }
+    }
+
     fn start_search_page(&mut self, ctx: &egui::Context, page: usize) {
         let query = self.search_query.trim().to_string();
         if query.is_empty() {
@@ -4308,6 +4475,7 @@ impl AppState {
         let page = page.max(1);
         self.search_page = page;
         let search_source = self.search_source;
+        let solidtorrents_sort_by_date = self.solidtorrents_sort_by_date;
         let results_clone = self.search_results.clone();
         let total_pages_clone = self.search_total_pages.clone();
         let is_searching_clone = self.is_searching.clone();
@@ -4327,6 +4495,7 @@ impl AppState {
             SearchSource::ExtTo => "Searching ext mirrors...".to_string(),
         };
         results_clone.lock().unwrap().clear();
+        self.save_current_search_state();
 
         thread::spawn(move || {
             let mirrors = load_search_mirrors(search_source);
@@ -4376,7 +4545,13 @@ impl AppState {
                         }
                         SearchSource::SolidTorrents => {
                             let (movies, total_pages) =
-                                scrape_solidtorrents_api_page(&agent, &mirror, &query, page);
+                                scrape_solidtorrents_api_page(
+                                    &agent,
+                                    &mirror,
+                                    &query,
+                                    page,
+                                    solidtorrents_sort_by_date,
+                                );
                             (movies, true, total_pages)
                         }
                         SearchSource::ExtTo => {
@@ -4486,7 +4661,14 @@ impl AppState {
                                 scrape_1337x_html_fallback(&agent, &mirror, &query)
                             }
                             SearchSource::SolidTorrents => {
-                                scrape_solidtorrents_api_page(&agent, &mirror, &query, page).0
+                                scrape_solidtorrents_api_page(
+                                    &agent,
+                                    &mirror,
+                                    &query,
+                                    page,
+                                    solidtorrents_sort_by_date,
+                                )
+                                .0
                             }
                             SearchSource::ExtTo => scrape_ext_html_fallback(&agent, &mirror, &query),
                         };
@@ -5189,13 +5371,11 @@ impl eframe::App for AppState {
                                     let selected = self.search_source == source;
                                     if ui.selectable_label(selected, source.source_label()).clicked() {
                                         if self.search_source != source {
-                                            self.search_results.lock().unwrap().clear();
-                                            self.search_status.lock().unwrap().clear();
-                                            *self.search_total_pages.lock().unwrap() = None;
-                                            self.search_page = 1;
+                                            self.save_current_search_state();
                                         }
                                         self.search_manual_mode = false;
                                         self.search_source = source;
+                                        self.load_search_state(source);
                                         self.mirror_checker_source = source;
                                         self.show_mirror_checker = false;
                                         self.mirror_statuses.lock().unwrap().clear();
@@ -5301,6 +5481,15 @@ impl eframe::App for AppState {
                                     }
                             }
 
+                            if self.search_source == SearchSource::SolidTorrents {
+                                ui.menu_button("Search Options", |ui| {
+                                    ui.checkbox(
+                                        &mut self.solidtorrents_sort_by_date,
+                                        "Sort by uploaded date on the API",
+                                    );
+                                });
+                            }
+
                             if ui.button("🌐 Mirror Status Checker").clicked() {
                                 self.show_mirror_checker = true;
                             }
@@ -5394,11 +5583,19 @@ impl eframe::App for AppState {
                                                 if let Some(r) = movie.rating {
                                                     ui.label(egui::RichText::new(format!("★ {}/10", r)).color(egui::Color32::from_rgb(255, 200, 0)));
                                                 }
-                                                if let Some(rt) = movie.runtime {
-                                                    ui.label(format!("⏱ {} min", rt));
+	                                                if let Some(rt) = movie.runtime {
+	                                                    ui.label(format!("⏱ {} min", rt));
+	                                                }
+                                                if let Some(genres) = movie.genres.as_ref() {
+                                                    if !genres.is_empty() {
+                                                        ui.label(
+                                                            egui::RichText::new(genres.join(", "))
+                                                                .weak(),
+                                                        );
+                                                    }
                                                 }
 
-                                                ui.separator();
+	                                                ui.separator();
 
                                                 let add_label = match effective_media_kind {
                                                     MediaKind::Other => "⛔ Not Video",
@@ -5524,28 +5721,44 @@ impl eframe::App for AppState {
 	                                                }
                                             });
 
-	                                            ui.horizontal(|ui| {
-                                                let color = match effective_media_kind {
-                                                    MediaKind::Movie => egui::Color32::from_rgb(0, 200, 100),
-                                                    MediaKind::Episodic => egui::Color32::from_rgb(220, 180, 0),
+		                                            ui.horizontal(|ui| {
+	                                                let color = match effective_media_kind {
+	                                                    MediaKind::Movie => egui::Color32::from_rgb(0, 200, 100),
+	                                                    MediaKind::Episodic => egui::Color32::from_rgb(220, 180, 0),
                                                     MediaKind::Video => egui::Color32::from_rgb(100, 180, 255),
-                                                    MediaKind::Other => egui::Color32::from_rgb(220, 90, 90),
-                                                    MediaKind::Unclassified => egui::Color32::GRAY,
-                                                };
-                                                ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "Type: {}",
-                                                        media_kind_label(
-                                                            effective_media_kind,
-                                                            movie.title_long.as_deref().unwrap_or(&movie.title),
+	                                                    MediaKind::Other => egui::Color32::from_rgb(220, 90, 90),
+	                                                    MediaKind::Unclassified => egui::Color32::GRAY,
+	                                                };
+	                                                ui.label(egui::RichText::new("Type:").strong());
+	                                                ui.label(
+	                                                    egui::RichText::new(
+                                                            media_kind_label(
+                                                                effective_media_kind,
+                                                                movie.title_long.as_deref().unwrap_or(&movie.title),
+                                                            )
                                                         )
-                                                    ))
-                                                    .color(color)
-                                                    .strong(),
-                                                );
-                                                if effective_media_kind == MediaKind::Other {
-                                                    ui.label(
-                                                        egui::RichText::new(
+	                                                    .color(color)
+	                                                    .strong(),
+	                                                );
+                                                    if let Some(uploaded_at) = movie.uploaded_at.as_deref() {
+                                                        ui.label(
+                                                            egui::RichText::new(format!("Uploaded {}", uploaded_at))
+                                                                .weak(),
+                                                        );
+                                                    }
+                                                    for torrent in &movie.torrents {
+                                                        let btn_text = format!(
+                                                            "📥 {} ({}) [found on {} site{}]",
+                                                            torrent.quality,
+                                                            torrent.size,
+                                                            torrent.found_count,
+                                                            if torrent.found_count == 1 { "" } else { "s" }
+                                                        );
+                                                        ui.label(egui::RichText::new(btn_text).weak());
+                                                    }
+	                                                if effective_media_kind == MediaKind::Other {
+	                                                    ui.label(
+	                                                        egui::RichText::new(
                                                             "Use Manual add to keep it anyway."
                                                         )
                                                         .weak(),
@@ -5553,27 +5766,8 @@ impl eframe::App for AppState {
                                                 }
                                             });
 
-                                            if let Some(genres) = movie.genres {
-                                                ui.label(egui::RichText::new(genres.join(", ")).weak());
-                                            }
-
-                                            ui.add_space(4.0);
-                                            ui.horizontal_wrapped(|ui| {
-                                                ui.label(egui::RichText::new("Stream Options:").strong());
-                                                for torrent in &movie.torrents {
-                                                    let btn_text = format!(
-                                                        "📥 {} ({}) [found on {} site{}]",
-                                                        torrent.quality,
-                                                        torrent.size,
-                                                        torrent.found_count,
-                                                        if torrent.found_count == 1 { "" } else { "s" }
-                                                    );
-                                                    ui.label(egui::RichText::new(btn_text).weak());
-                                                }
-                                            });
-
-                                            ui.add_space(4.0);
-                                        });
+	                                            ui.add_space(4.0);
+	                                        });
                                     });
                                     ui.add_space(6.0);
                                 }
