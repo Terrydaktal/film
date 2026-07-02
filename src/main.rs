@@ -120,6 +120,257 @@ fn get_cache_dir() -> PathBuf {
     PathBuf::from("./stream_cache")
 }
 
+fn slugify_cache_title(title: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_sep = false;
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            slug.push('-');
+            last_was_sep = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "film".to_string()
+    } else {
+        slug.chars().take(80).collect()
+    }
+}
+
+fn cache_root_dir_name(title: &str, year: Option<u16>, hash: &str) -> String {
+    let mut display = title.trim().to_string();
+    if let Some(year) = year {
+        display.push_str(&format!("-{}", year));
+    }
+    let slug = slugify_cache_title(&display);
+    let clean_hash = hash
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_uppercase();
+    if clean_hash.len() == 40 {
+        format!("{}_{}", slug, clean_hash)
+    } else {
+        format!("{}_{}", slug, hash)
+    }
+}
+
+fn cache_root_hash_from_dir_name(dir_name: &str) -> Option<String> {
+    dir_name
+        .strip_prefix("torrent_")
+        .or_else(|| dir_name.rsplit_once('_').map(|(_, hash)| hash))
+        .and_then(|hash| {
+            let clean_hash = hash
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .collect::<String>()
+                .to_uppercase();
+            (clean_hash.len() == 40).then_some(clean_hash)
+        })
+}
+
+fn torrent_option_cache_subdir(hash: &str) -> String {
+    let clean_hash: String = hash
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_uppercase();
+    if clean_hash.len() == 40 {
+        format!("option_{}", clean_hash)
+    } else {
+        let safe_hash: String = hash
+            .chars()
+            .map(|c| if matches!(c, '/' | '\\' | ':') { '_' } else { c })
+            .collect();
+        format!("option_{}", safe_hash)
+    }
+}
+
+fn torrent_file_info_hash(cache_dir: &std::path::Path) -> Option<String> {
+    let torrent_bytes = fs::read(cache_dir.join("movie.torrent")).ok()?;
+    let info_bytes = bencoded_info_dict_bytes(&torrent_bytes)?;
+    let digest = Sha1::digest(info_bytes);
+    Some(digest.iter().map(|byte| format!("{:02X}", byte)).collect())
+}
+
+fn skip_bencoded_value(data: &[u8], pos: &mut usize) -> Option<()> {
+    match *data.get(*pos)? {
+        b'i' => {
+            *pos += 1;
+            while *data.get(*pos)? != b'e' {
+                *pos += 1;
+            }
+            *pos += 1;
+            Some(())
+        }
+        b'l' | b'd' => {
+            *pos += 1;
+            while *data.get(*pos)? != b'e' {
+                skip_bencoded_value(data, pos)?;
+            }
+            *pos += 1;
+            Some(())
+        }
+        b'0'..=b'9' => {
+            let start = *pos;
+            while *data.get(*pos)? != b':' {
+                *pos += 1;
+            }
+            let len: usize = std::str::from_utf8(&data[start..*pos]).ok()?.parse().ok()?;
+            *pos += 1;
+            *pos = pos.checked_add(len)?;
+            if *pos <= data.len() {
+                Some(())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn bencoded_info_dict_bytes(data: &[u8]) -> Option<&[u8]> {
+    if *data.first()? != b'd' {
+        return None;
+    }
+
+    let mut pos = 1;
+    while *data.get(pos)? != b'e' {
+        let key_start = pos;
+        while *data.get(pos)? != b':' {
+            pos += 1;
+        }
+        let key_len: usize = std::str::from_utf8(&data[key_start..pos])
+            .ok()?
+            .parse()
+            .ok()?;
+        pos += 1;
+        let key_end = pos.checked_add(key_len)?;
+        if key_end > data.len() {
+            return None;
+        }
+        let key = &data[pos..key_end];
+        pos = key_end;
+
+        let value_start = pos;
+        skip_bencoded_value(data, &mut pos)?;
+        if key == b"info" {
+            return Some(&data[value_start..pos]);
+        }
+    }
+
+    None
+}
+
+fn torrent_option_cache_path(
+    parent_cache_path: &std::path::Path,
+    quality: &str,
+    hash: &str,
+    size_hint: Option<u64>,
+    allow_legacy_size_match: bool,
+    uses_root_cache: bool,
+) -> PathBuf {
+    if uses_root_cache {
+        return parent_cache_path.to_path_buf();
+    }
+
+    let hash_path = parent_cache_path.join(torrent_option_cache_subdir(hash));
+    if hash_path.exists() {
+        return hash_path;
+    }
+
+    let legacy_quality_path = parent_cache_path.join(quality);
+    let legacy_hash_matches = torrent_file_info_hash(&legacy_quality_path)
+        .is_some_and(|legacy_hash| legacy_hash.eq_ignore_ascii_case(hash));
+    let legacy_size_matches = allow_legacy_size_match && size_hint
+        .is_some_and(|size_hint| legacy_cache_size_matches(&legacy_quality_path, size_hint));
+    if legacy_quality_path.exists() && (legacy_hash_matches || legacy_size_matches) {
+        legacy_quality_path
+    } else {
+        hash_path
+    }
+}
+
+fn legacy_cache_size_bytes(cache_dir: &std::path::Path) -> Option<u64> {
+    saved_torrent_file_progress_totals(cache_dir)
+        .map(|(_, total)| total)
+        .or_else(|| {
+            let disk_size = get_payload_disk_space(cache_dir);
+            (disk_size > 0).then_some(disk_size)
+        })
+}
+
+fn legacy_cache_size_matches(cache_dir: &std::path::Path, size_hint: u64) -> bool {
+    if size_hint == 0 {
+        return false;
+    }
+    let Some(legacy_size) = legacy_cache_size_bytes(cache_dir) else {
+        return false;
+    };
+    let diff = legacy_size.abs_diff(size_hint);
+    let tolerance = (size_hint / 12).max(64 * 1024 * 1024);
+    diff <= tolerance
+}
+
+fn legacy_cache_size_best_matches_option(
+    cache_dir: &std::path::Path,
+    current_hash: &str,
+    current_quality: &str,
+    current_size_hint: Option<u64>,
+    options: &[TorrentOption],
+) -> bool {
+    let Some(current_size_hint) = current_size_hint else {
+        return false;
+    };
+    let Some(legacy_size) = legacy_cache_size_bytes(cache_dir) else {
+        return false;
+    };
+    let current_diff = legacy_size.abs_diff(current_size_hint);
+    let tolerance = (current_size_hint / 12).max(64 * 1024 * 1024);
+    if current_diff > tolerance {
+        return false;
+    }
+
+    for opt in options {
+        if !opt.quality.eq_ignore_ascii_case(current_quality)
+            || opt.hash.eq_ignore_ascii_case(current_hash)
+        {
+            continue;
+        }
+        if let Some(other_size_hint) = parse_size_to_bytes(&opt.size) {
+            let other_diff = legacy_size.abs_diff(other_size_hint);
+            if other_diff < current_diff {
+                return false;
+            }
+            if other_diff == current_diff && opt.hash.as_str() < current_hash {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn sibling_option_cache_subdirs(
+    option_markers: &[(String, String, String)],
+    current_hash: &str,
+) -> Vec<String> {
+    let mut excluded = Vec::new();
+    for (hash, quality, option_subdir) in option_markers {
+        if hash.eq_ignore_ascii_case(current_hash) {
+            continue;
+        }
+        excluded.push(quality.clone());
+        excluded.push(option_subdir.clone());
+    }
+    excluded.sort();
+    excluded.dedup();
+    excluded
+}
+
 // Helper to extract a 40-character SHA1 infohash from a torrent or magnet link
 fn get_infohash(url: &str) -> Option<String> {
     for part in url.split(&['/', '?', '=', '&', ':', '-'][..]) {
@@ -212,15 +463,28 @@ fn should_show_source_url(url: &str, launch_magnet: &str) -> bool {
 
 // Helper to locate the largest media file inside a directory recursively
 fn find_media_file(dir: &std::path::Path) -> Option<PathBuf> {
+    find_media_file_excluding(dir, &[])
+}
+
+fn find_media_file_excluding(dir: &std::path::Path, excluded_direct_children: &[String]) -> Option<PathBuf> {
     let mut largest_file = None;
     let mut max_size = 0;
 
-    fn visit_dirs(dir: &std::path::Path, largest: &mut Option<PathBuf>, max_sz: &mut u64) {
+    fn visit_dirs(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        excluded_direct_children: &[String],
+        largest: &mut Option<PathBuf>,
+        max_sz: &mut u64,
+    ) {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
+                if is_under_excluded_direct_child(root, &path, excluded_direct_children) {
+                    continue;
+                }
                 if path.is_dir() {
-                    visit_dirs(&path, largest, max_sz);
+                    visit_dirs(root, &path, excluded_direct_children, largest, max_sz);
                 } else if path.is_file() {
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         let ext_lower = ext.to_lowercase();
@@ -240,8 +504,26 @@ fn find_media_file(dir: &std::path::Path) -> Option<PathBuf> {
         }
     }
 
-    visit_dirs(dir, &mut largest_file, &mut max_size);
+    visit_dirs(dir, dir, excluded_direct_children, &mut largest_file, &mut max_size);
     largest_file
+}
+
+fn is_under_excluded_direct_child(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    excluded_direct_children: &[String],
+) -> bool {
+    if excluded_direct_children.is_empty() {
+        return false;
+    }
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .and_then(|component| match component {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .is_some_and(|name| excluded_direct_children.iter().any(|excluded| excluded == name))
 }
 
 fn remove_empty_dirs_up_to(mut dir: PathBuf, stop_at: &std::path::Path) {
@@ -655,10 +937,7 @@ fn local_playback_guard(
     cache_dir: &std::path::Path,
     media_path: &std::path::Path,
 ) -> Result<(), String> {
-    refresh_verified_torrent_progress_if_needed(cache_dir, media_path);
-    if get_verified_local_playback_state(cache_dir).is_none() {
-        write_verified_torrent_progress_with_mode(cache_dir, media_path, true);
-    }
+    write_verified_torrent_progress_with_mode(cache_dir, media_path, true);
     let verified_state = get_verified_local_playback_state(cache_dir);
     let fallback_state = get_torrent_downloaded_and_total(cache_dir);
     let ((contiguous_prefix, total), playable_prefix, used_fallback) = if let Some((contiguous_prefix, total, playable_prefix)) = verified_state {
@@ -679,6 +958,10 @@ fn local_playback_guard(
 
     let min_required = MIN_LOCAL_PLAY_CONTIGUOUS_BYTES.min(total);
     if contiguous_prefix >= min_required {
+        return Ok(());
+    }
+
+    if mpv_can_start_at_ratio(media_path, 0.0) {
         return Ok(());
     }
 
@@ -1515,9 +1798,7 @@ fn find_existing_cache_dir_for_movie(
             continue;
         }
 
-        let dir_hash = dir_name
-            .strip_prefix("torrent_")
-            .map(|hash| hash.to_uppercase());
+        let dir_hash = cache_root_hash_from_dir_name(&dir_name);
         let dir_matches = dir_hash
             .as_ref()
             .is_some_and(|hash| incoming_hashes.iter().any(|incoming| incoming == hash));
@@ -1610,12 +1891,37 @@ fn get_folder_disk_space(dir: &std::path::Path) -> u64 {
     get_folder_disk_space_filtered(dir, &|_| true)
 }
 
+fn get_folder_disk_space_excluding(
+    dir: &std::path::Path,
+    excluded_direct_children: &[String],
+) -> u64 {
+    get_folder_disk_space_filtered(dir, &|path| {
+        !is_under_excluded_direct_child(dir, path, excluded_direct_children)
+    })
+}
+
 fn get_payload_disk_space(dir: &std::path::Path) -> u64 {
     get_folder_disk_space_filtered(dir, &|path| !is_control_artifact_path(path))
 }
 
-fn get_control_disk_space(dir: &std::path::Path) -> u64 {
-    get_folder_disk_space_filtered(dir, &is_control_artifact_path)
+fn get_payload_disk_space_excluding(
+    dir: &std::path::Path,
+    excluded_direct_children: &[String],
+) -> u64 {
+    get_folder_disk_space_filtered(dir, &|path| {
+        !is_control_artifact_path(path)
+            && !is_under_excluded_direct_child(dir, path, excluded_direct_children)
+    })
+}
+
+fn get_control_disk_space_excluding(
+    dir: &std::path::Path,
+    excluded_direct_children: &[String],
+) -> u64 {
+    get_folder_disk_space_filtered(dir, &|path| {
+        is_control_artifact_path(path)
+            && !is_under_excluded_direct_child(dir, path, excluded_direct_children)
+    })
 }
 
 fn parse_size_to_bytes(text: &str) -> Option<u64> {
@@ -2024,69 +2330,6 @@ fn file_len_and_mtime_ns(path: &std::path::Path) -> Option<(u64, u64)> {
     Some((metadata.len(), mtime_ns))
 }
 
-fn verified_progress_is_current(cache_dir: &std::path::Path, media_path: &std::path::Path) -> bool {
-    let torrent_path = cache_dir.join("movie.torrent");
-    let progress_path = progress_file_path(cache_dir);
-    let (media_size, media_mtime_ns) = match file_len_and_mtime_ns(media_path) {
-        Some(stamp) => stamp,
-        None => return false,
-    };
-    let (torrent_size, torrent_mtime_ns) = match file_len_and_mtime_ns(&torrent_path) {
-        Some(stamp) => stamp,
-        None => return false,
-    };
-
-    let progress = match fs::read_to_string(progress_path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-    {
-        Some(progress) => progress,
-        None => return false,
-    };
-
-    progress
-        .get("verifier_version")
-        .and_then(serde_json::Value::as_u64)
-        == Some(PROGRESS_VERIFIER_VERSION)
-        && progress
-            .get("media_size_bytes")
-            .and_then(serde_json::Value::as_u64)
-            == Some(media_size)
-        && progress
-            .get("media_mtime_ns")
-            .and_then(serde_json::Value::as_u64)
-            == Some(media_mtime_ns)
-        && progress
-            .get("torrent_size_bytes")
-            .and_then(serde_json::Value::as_u64)
-            == Some(torrent_size)
-        && progress
-            .get("torrent_mtime_ns")
-            .and_then(serde_json::Value::as_u64)
-            == Some(torrent_mtime_ns)
-        && progress
-            .get("total_bytes")
-            .and_then(serde_json::Value::as_u64)
-            .is_some()
-        && progress
-            .get("downloaded_bytes")
-            .and_then(serde_json::Value::as_u64)
-            .is_some()
-        && progress
-            .get("ranges")
-            .and_then(serde_json::Value::as_array)
-            .is_some()
-}
-
-fn refresh_verified_torrent_progress_if_needed(
-    cache_dir: &std::path::Path,
-    media_path: &std::path::Path,
-) {
-    if !verified_progress_is_current(cache_dir, media_path) {
-        write_verified_torrent_ranges_progress(cache_dir, media_path);
-    }
-}
-
 fn write_verified_torrent_ranges_progress(
     cache_dir: &std::path::Path,
     media_path: &std::path::Path,
@@ -2245,31 +2488,31 @@ fn spawn_gap_aware_progress_scanner(dest_dir: PathBuf, dir_name: String, torrent
     });
 }
 
-fn probe_mpv_playable_prefix(media_path: &std::path::Path) -> f64 {
-    fn can_start_at(media_path: &std::path::Path, ratio: f64) -> bool {
-        let start = format!("--start={:.3}%", ratio * 100.0);
-        Command::new("mpv")
-            .args([
-                "--no-config",
-                "--really-quiet",
-                "--vo=null",
-                "--ao=null",
-                "--frames=120",
-                "--no-resume-playback",
-                &start,
-                media_path.to_str().unwrap_or_default(),
-            ])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
+fn mpv_can_start_at_ratio(media_path: &std::path::Path, ratio: f64) -> bool {
+    let start = format!("--start={:.3}%", ratio * 100.0);
+    Command::new("mpv")
+        .args([
+            "--no-config",
+            "--really-quiet",
+            "--vo=null",
+            "--ao=null",
+            "--frames=120",
+            "--no-resume-playback",
+            &start,
+            media_path.to_str().unwrap_or_default(),
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
 
+fn probe_mpv_playable_prefix(media_path: &std::path::Path) -> f64 {
     let mut low = 0.0;
     let mut high = 1.0;
 
     for _ in 0..8 {
         let mid = (low + high) / 2.0;
-        if can_start_at(media_path, mid) {
+        if mpv_can_start_at_ratio(media_path, mid) {
             low = mid;
         } else {
             high = mid;
@@ -3746,14 +3989,15 @@ fn get_torrent_downloaded_and_total(cache_dir: &std::path::Path) -> Option<(u64,
     None
 }
 
-fn get_live_downloaded_and_total(
+fn get_live_downloaded_and_total_excluding(
     cache_dir: &std::path::Path,
     total_hint: Option<u64>,
+    excluded_direct_children: &[String],
 ) -> Option<(u64, u64)> {
     if let Some((downloaded, total)) = saved_torrent_file_progress_totals(cache_dir) {
         return Some((downloaded, total));
     }
-    let disk_used = get_payload_disk_space(cache_dir);
+    let disk_used = get_payload_disk_space_excluding(cache_dir, excluded_direct_children);
     if let Some((downloaded, total)) = get_torrent_downloaded_and_total(cache_dir) {
         return Some((downloaded.max(disk_used).min(total), total));
     }
@@ -3826,8 +4070,36 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
 
     for torrent in &group.torrents {
         let cache_dir_path = get_cache_dir().join(&torrent.dir_name);
+        let root_hash = cache_root_hash_from_dir_name(&torrent.dir_name);
+        let option_cache_markers: Vec<(String, String, String)> = torrent
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.torrent_options.as_ref())
+            .map(|options| {
+                options
+                    .iter()
+                    .map(|opt| {
+                        let hash = opt.hash.to_uppercase();
+                        (
+                            hash.clone(),
+                            opt.quality.clone(),
+                            torrent_option_cache_subdir(&hash),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let root_excluded_subdirs = root_hash
+            .as_ref()
+            .map(|hash| sibling_option_cache_subdirs(&option_cache_markers, hash))
+            .unwrap_or_default();
         if let Some((downloaded, total)) = get_torrent_downloaded_and_total(&cache_dir_path) {
-            let live_downloaded = downloaded.max(get_payload_disk_space(&cache_dir_path)).min(total);
+            let live_downloaded = downloaded
+                .max(get_payload_disk_space_excluding(
+                    &cache_dir_path,
+                    &root_excluded_subdirs,
+                ))
+                .min(total);
             let pct = if total > 0 {
                 (live_downloaded as f64 / total as f64) * 100.0
             } else {
@@ -3844,19 +4116,52 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
         if let Some(ref meta) = torrent.metadata {
             if let Some(ref options) = meta.torrent_options {
                 for opt in options {
-                    let quality_path = cache_dir_path.join(&opt.quality);
-                    if let Some((downloaded, total)) = get_torrent_downloaded_and_total(&quality_path)
+                    let hash = opt.hash.to_uppercase();
+                    let size_hint = parse_size_to_bytes(&opt.size);
+                    let uses_root_cache = root_hash
+                        .as_ref()
+                        .is_some_and(|root| root.eq_ignore_ascii_case(&hash));
+                    let allow_legacy_size_match = legacy_cache_size_best_matches_option(
+                        &cache_dir_path.join(&opt.quality),
+                        &hash,
+                        &opt.quality,
+                        size_hint,
+                        options,
+                    );
+                    let option_path = torrent_option_cache_path(
+                        &cache_dir_path,
+                        &opt.quality,
+                        &hash,
+                        size_hint,
+                        allow_legacy_size_match,
+                        uses_root_cache,
+                    );
+                    let excluded_subdirs = if uses_root_cache {
+                        sibling_option_cache_subdirs(&option_cache_markers, &hash)
+                    } else {
+                        Vec::new()
+                    };
+                    let has_option_state = option_path.join(".torrent_progress.json").exists()
+                        || option_path.join(".torrent_file_progress.json").exists()
+                        || option_path.join("movie.torrent").exists()
+                        || get_payload_disk_space_excluding(&option_path, &excluded_subdirs) > 0;
+                    if !has_option_state {
+                        continue;
+                    }
+                    if let Some((downloaded, total)) = get_live_downloaded_and_total_excluding(
+                        &option_path,
+                        parse_size_to_bytes(&opt.size),
+                        &excluded_subdirs,
+                    )
                     {
-                        let live_downloaded =
-                            downloaded.max(get_payload_disk_space(&quality_path)).min(total);
                         let pct = if total > 0 {
-                            (live_downloaded as f64 / total as f64) * 100.0
+                            (downloaded as f64 / total as f64) * 100.0
                         } else {
                             0.0
                         };
                         entries.push(format!(
                             "{} / {} ({:.2}%)",
-                            format_size(live_downloaded),
+                            format_size(downloaded),
                             format_size(total),
                             pct
                         ));
@@ -3875,7 +4180,33 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
     let live_disk_used: u64 = group
         .torrents
         .iter()
-        .map(|torrent| get_folder_disk_space(&get_cache_dir().join(&torrent.dir_name)))
+        .map(|torrent| {
+            let cache_dir_path = get_cache_dir().join(&torrent.dir_name);
+            let root_hash = cache_root_hash_from_dir_name(&torrent.dir_name);
+            let option_cache_markers: Vec<(String, String, String)> = torrent
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.torrent_options.as_ref())
+                .map(|options| {
+                    options
+                        .iter()
+                        .map(|opt| {
+                            let hash = opt.hash.to_uppercase();
+                            (
+                                hash.clone(),
+                                opt.quality.clone(),
+                                torrent_option_cache_subdir(&hash),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let excluded_subdirs = root_hash
+                .as_ref()
+                .map(|hash| sibling_option_cache_subdirs(&option_cache_markers, hash))
+                .unwrap_or_default();
+            get_folder_disk_space_excluding(&cache_dir_path, &excluded_subdirs)
+        })
         .sum();
     format!("0 B ({})", format_size(live_disk_used))
 }
@@ -5089,17 +5420,68 @@ impl eframe::App for AppState {
  
                              // Find the highest download percentage and check if complete
                              let mut max_pct = 0.0;
-                             let mut is_complete = false;
-                             for t in &group.torrents {
-                                 let cache_dir_path = get_cache_dir().join(&t.dir_name);
-                                 if let Some(ref meta) = t.metadata {
-                                     if let Some(ref options) = meta.torrent_options {
-                                         for opt in options {
-                                             let sub_path = cache_dir_path.join(&opt.quality);
-                                             if let Some((dl, tot)) = get_torrent_downloaded_and_total(&sub_path) {
-                                                 if tot > 0 {
-                                                     let pct = (dl as f64 / tot as f64) * 100.0;
-                                                     if pct > max_pct {
+	                             let mut is_complete = false;
+	                             for t in &group.torrents {
+	                                 let cache_dir_path = get_cache_dir().join(&t.dir_name);
+                                     let root_hash = cache_root_hash_from_dir_name(&t.dir_name);
+                                     let option_cache_markers: Vec<(String, String, String)> = t
+                                         .metadata
+                                         .as_ref()
+                                         .and_then(|meta| meta.torrent_options.as_ref())
+                                         .map(|options| {
+                                             options
+                                                 .iter()
+                                                 .map(|opt| {
+                                                     let hash = opt.hash.to_uppercase();
+                                                     (
+                                                         hash.clone(),
+                                                         opt.quality.clone(),
+                                                         torrent_option_cache_subdir(&hash),
+                                                     )
+                                                 })
+                                                 .collect()
+                                         })
+                                         .unwrap_or_default();
+	                                 if let Some(ref meta) = t.metadata {
+	                                     if let Some(ref options) = meta.torrent_options {
+	                                         for opt in options {
+                                                 let hash = opt.hash.to_uppercase();
+                                                 let size_hint = parse_size_to_bytes(&opt.size);
+	                                                 let uses_root_cache = root_hash
+	                                                     .as_ref()
+	                                                     .is_some_and(|root| root.eq_ignore_ascii_case(&hash));
+                                                 let allow_legacy_size_match =
+                                                     legacy_cache_size_best_matches_option(
+                                                         &cache_dir_path.join(&opt.quality),
+                                                         &hash,
+                                                         &opt.quality,
+                                                         size_hint,
+                                                         options,
+                                                     );
+	                                                 let option_path = torrent_option_cache_path(
+	                                                     &cache_dir_path,
+	                                                     &opt.quality,
+	                                                     &hash,
+	                                                     size_hint,
+                                                     allow_legacy_size_match,
+	                                                     uses_root_cache,
+	                                                 );
+                                                 let excluded_subdirs = if uses_root_cache {
+                                                     sibling_option_cache_subdirs(
+                                                         &option_cache_markers,
+                                                         &hash,
+                                                     )
+                                                 } else {
+                                                     Vec::new()
+                                                 };
+	                                             if let Some((dl, tot)) = get_live_downloaded_and_total_excluding(
+                                                     &option_path,
+                                                     parse_size_to_bytes(&opt.size),
+                                                     &excluded_subdirs,
+                                                 ) {
+	                                                 if tot > 0 {
+	                                                     let pct = (dl as f64 / tot as f64) * 100.0;
+	                                                     if pct > max_pct {
                                                          max_pct = pct;
                                                      }
                                                      if dl >= tot {
@@ -5108,11 +5490,21 @@ impl eframe::App for AppState {
                                                  }
                                              }
                                          }
-                                     }
-                                 }
-                                 if let Some((dl, tot)) = get_torrent_downloaded_and_total(&cache_dir_path) {
-                                     if tot > 0 {
-                                         let pct = (dl as f64 / tot as f64) * 100.0;
+	                                     }
+	                                 }
+                                     let root_excluded_subdirs = root_hash
+                                         .as_ref()
+                                         .map(|hash| {
+                                             sibling_option_cache_subdirs(&option_cache_markers, hash)
+                                         })
+                                         .unwrap_or_default();
+	                                 if let Some((dl, tot)) = get_live_downloaded_and_total_excluding(
+                                         &cache_dir_path,
+                                         Some(t.logical_size_bytes),
+                                         &root_excluded_subdirs,
+                                     ) {
+	                                     if tot > 0 {
+	                                         let pct = (dl as f64 / tot as f64) * 100.0;
                                          if pct > max_pct {
                                              max_pct = pct;
                                          }
@@ -5488,7 +5880,11 @@ impl eframe::App for AppState {
                                                     cleaned
                                                 }
                                             });
-                                            let dir_name = format!("torrent_{}", hash);
+                                            let manual_title = get_infohash(&url)
+                                                .map(|_| "manual-torrent".to_string())
+                                                .unwrap_or_else(|| hash.clone());
+                                            let dir_name =
+                                                cache_root_dir_name(&manual_title, None, &hash);
                                             let dest_dir = get_cache_dir().join(&dir_name);
                                             let _ = fs::create_dir_all(&dest_dir);
 
@@ -5697,7 +6093,13 @@ impl eframe::App for AppState {
                                                             movie.year,
                                                             &incoming_hashes,
                                                         )
-                                                        .unwrap_or_else(|| format!("torrent_{}", first_hash));
+                                                        .unwrap_or_else(|| {
+                                                            cache_root_dir_name(
+                                                                &movie.title,
+                                                                movie.year,
+                                                                &first_hash,
+                                                            )
+                                                        });
                                                         let dest_dir = get_cache_dir().join(&dir_name);
                                                         let _ = fs::create_dir_all(&dest_dir);
 
@@ -5926,18 +6328,42 @@ impl PanelRenderHelper for AppState {
         // Quality Option Buttons at the top (from metadata.torrent_options)
         if let Some(torrent) = primary_torrent.clone() {
             let parent_cache_path = get_cache_dir().join(&torrent.dir_name);
-            let root_media = find_media_file(&parent_cache_path);
+            let root_hash = cache_root_hash_from_dir_name(&torrent.dir_name);
+            let torrent_options = torrent
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.torrent_options.clone());
+            let root_option_cache_markers: Vec<(String, String, String)> = torrent_options
+                .as_ref()
+                .map(|options| {
+                    options
+                        .iter()
+                        .map(|opt| {
+                            let hash = opt.hash.to_uppercase();
+                            (
+                                hash.clone(),
+                                opt.quality.clone(),
+                                torrent_option_cache_subdir(&hash),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let root_excluded_subdirs = root_hash
+                .as_ref()
+                .map(|hash| sibling_option_cache_subdirs(&root_option_cache_markers, hash))
+                .unwrap_or_default();
+            let root_media = find_media_file_excluding(&parent_cache_path, &root_excluded_subdirs);
             let root_has_torrent = parent_cache_path.join("movie.torrent").exists();
             let root_is_active = {
                 let map = self.torrent_status.lock().unwrap();
                 map.get(&torrent.dir_name).map(|s| s.active).unwrap_or(false)
             };
-            let root_has_cache_artifacts = has_local_cache_artifacts(&parent_cache_path);
-            let root_hash = torrent.dir_name.strip_prefix("torrent_").map(|hash| hash.to_uppercase());
-            let torrent_options = torrent
-                .metadata
-                .as_ref()
-                .and_then(|meta| meta.torrent_options.clone());
+            let root_payload_disk =
+                get_payload_disk_space_excluding(&parent_cache_path, &root_excluded_subdirs);
+            let root_control_disk =
+                get_control_disk_space_excluding(&parent_cache_path, &root_excluded_subdirs);
+            let root_has_cache_artifacts = root_payload_disk > 0 || root_control_disk > 0;
             let has_torrent_options = torrent_options.as_ref().is_some_and(|options| !options.is_empty());
             let root_status_bound_to_option = torrent_options.as_ref().is_some_and(|options| {
                 root_hash.as_ref().is_some_and(|hash| {
@@ -6011,10 +6437,9 @@ impl PanelRenderHelper for AppState {
 
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Disk Space Used:").strong());
-                                    ui.label(format_size(get_payload_disk_space(&parent_cache_path)));
+                                    ui.label(format_size(root_payload_disk));
                                 });
 
-                                let root_control_disk = get_control_disk_space(&parent_cache_path);
                                 if root_control_disk > 0 {
                                     ui.horizontal(|ui| {
                                         ui.label(
@@ -6105,22 +6530,30 @@ impl PanelRenderHelper for AppState {
 	                                        .color(egui::Color32::from_rgb(0, 220, 100))
 	                                        .strong(),
 	                                    );
-		                                } else if let Some((dl, total)) =
-		                                    get_live_downloaded_and_total(&parent_cache_path, Some(torrent.logical_size_bytes))
-		                                {
-                                    let pct = if total > 0 { (dl as f64 / total as f64) * 100.0 } else { 0.0 };
-                                    ui.label(format!("{} / {} ({:.2}%)", format_size(dl), format_size(total), pct));
-                                } else {
-                                    ui.label(format_size(get_payload_disk_space(&parent_cache_path)));
-                                }
-                            } else if let Some((dl, total)) =
-                                get_live_downloaded_and_total(&parent_cache_path, Some(torrent.logical_size_bytes))
-                            {
-                                let pct = if total > 0 { (dl as f64 / total as f64) * 100.0 } else { 0.0 };
-	                                ui.label(format!("{} / {} ({:.2}%)", format_size(dl), format_size(total), pct));
-	                            } else {
-	                                ui.label(format_size(get_payload_disk_space(&parent_cache_path)));
-	                            }
+			                                } else if let Some((dl, total)) =
+			                                    get_live_downloaded_and_total_excluding(
+                                                    &parent_cache_path,
+                                                    Some(torrent.logical_size_bytes),
+                                                    &root_excluded_subdirs,
+                                                )
+			                                {
+	                                    let pct = if total > 0 { (dl as f64 / total as f64) * 100.0 } else { 0.0 };
+	                                    ui.label(format!("{} / {} ({:.2}%)", format_size(dl), format_size(total), pct));
+	                                } else {
+	                                    ui.label(format_size(root_payload_disk));
+	                                }
+	                            } else if let Some((dl, total)) =
+	                                get_live_downloaded_and_total_excluding(
+                                        &parent_cache_path,
+                                        Some(torrent.logical_size_bytes),
+                                        &root_excluded_subdirs,
+                                    )
+	                            {
+	                                let pct = if total > 0 { (dl as f64 / total as f64) * 100.0 } else { 0.0 };
+		                                ui.label(format!("{} / {} ({:.2}%)", format_size(dl), format_size(total), pct));
+		                            } else {
+		                                ui.label(format_size(root_payload_disk));
+		                            }
 	                        });
                             if let Some(detail) = root_startup_detail {
                                 ui.label(
@@ -6207,11 +6640,9 @@ impl PanelRenderHelper for AppState {
                                 });
                                 if let Some(sequential_mode) = start_mode {
 	                                    let url_to_play = torrent.metadata.as_ref().map(|m| m.url.clone()).unwrap_or_default();
-                                        let root_hash_for_launch = torrent
-                                            .dir_name
-                                            .strip_prefix("torrent_")
-                                            .unwrap_or_default()
-                                            .to_string();
+                                        let root_hash_for_launch =
+                                            cache_root_hash_from_dir_name(&torrent.dir_name)
+                                                .unwrap_or_default();
                                     let dir_to_play = torrent.dir_name.clone();
                                     let children_clone = self.spawned_children.clone();
                                     let torrent_status_clone = self.torrent_status.clone();
@@ -6351,19 +6782,59 @@ impl PanelRenderHelper for AppState {
                     ui.label(egui::RichText::new("Torrent Options:").strong());
                     ui.add_space(4.0);
 
+                    let option_cache_markers: Vec<(String, String, String)> = options
+                        .iter()
+                        .map(|opt| {
+                            let hash = opt.hash.to_uppercase();
+                            (
+                                hash.clone(),
+                                opt.quality.clone(),
+                                torrent_option_cache_subdir(&hash),
+                            )
+                        })
+                        .collect();
+                    let options_for_matching = options.clone();
+
                     options.sort_by_key(|opt| {
                         let hash = opt.hash.to_uppercase();
+                        let size_hint = parse_size_to_bytes(&opt.size);
                         let uses_root_cache = root_hash
                             .as_ref()
                             .is_some_and(|root| root.eq_ignore_ascii_case(&hash));
-                        let local_cache_path = if uses_root_cache {
-                            parent_cache_path.clone()
+                        let allow_legacy_size_match = legacy_cache_size_best_matches_option(
+                            &parent_cache_path.join(&opt.quality),
+                            &hash,
+                            &opt.quality,
+                            size_hint,
+                            &options_for_matching,
+                        );
+                        let local_cache_path = torrent_option_cache_path(
+                            &parent_cache_path,
+                            &opt.quality,
+                            &hash,
+                            size_hint,
+                            allow_legacy_size_match,
+                            uses_root_cache,
+                        );
+                        let excluded_subdirs = if uses_root_cache {
+                            sibling_option_cache_subdirs(&option_cache_markers, &hash)
                         } else {
-                            parent_cache_path.join(&opt.quality)
+                            Vec::new()
                         };
-                        let local_media = find_media_file(&local_cache_path);
+                        let local_media =
+                            find_media_file_excluding(&local_cache_path, &excluded_subdirs);
                         let has_torrent = local_cache_path.join("movie.torrent").exists();
-                        let has_cache_artifacts = has_local_cache_artifacts(&local_cache_path);
+                        let has_cache_artifacts = if uses_root_cache {
+                            get_folder_disk_space_filtered(&local_cache_path, &|path| {
+                                !is_under_excluded_direct_child(
+                                    &local_cache_path,
+                                    path,
+                                    &excluded_subdirs,
+                                )
+                            }) > 0
+                        } else {
+                            has_local_cache_artifacts(&local_cache_path)
+                        };
                         let is_active = {
                             let map = self.torrent_status.lock().unwrap();
                             map.get(&hash).map(|s| s.active).unwrap_or(false)
@@ -6377,17 +6848,42 @@ impl PanelRenderHelper for AppState {
 
                     for opt in options {
                         let hash = opt.hash.to_uppercase();
+                        let size_hint = parse_size_to_bytes(&opt.size);
                         let uses_root_cache = root_hash
                             .as_ref()
                             .is_some_and(|root| root.eq_ignore_ascii_case(&hash));
-                        let local_cache_path = if uses_root_cache {
-                            parent_cache_path.clone()
+                        let allow_legacy_size_match = legacy_cache_size_best_matches_option(
+                            &parent_cache_path.join(&opt.quality),
+                            &hash,
+                            &opt.quality,
+                            size_hint,
+                            &options_for_matching,
+                        );
+                        let local_cache_path = torrent_option_cache_path(
+                            &parent_cache_path,
+                            &opt.quality,
+                            &hash,
+                            size_hint,
+                            allow_legacy_size_match,
+                            uses_root_cache,
+                        );
+                        let excluded_subdirs = if uses_root_cache {
+                            sibling_option_cache_subdirs(&option_cache_markers, &hash)
                         } else {
-                            parent_cache_path.join(&opt.quality)
+                            Vec::new()
                         };
-                        let local_media = find_media_file(&local_cache_path);
+                        let local_media =
+                            find_media_file_excluding(&local_cache_path, &excluded_subdirs);
                         let has_torrent = local_cache_path.join("movie.torrent").exists();
-                        let has_cache_artifacts = has_local_cache_artifacts(&local_cache_path);
+                        let local_payload_disk =
+                            get_payload_disk_space_excluding(&local_cache_path, &excluded_subdirs);
+                        let local_control_disk =
+                            get_control_disk_space_excluding(&local_cache_path, &excluded_subdirs);
+                        let has_cache_artifacts = if uses_root_cache {
+                            local_payload_disk > 0 || local_control_disk > 0
+                        } else {
+                            has_local_cache_artifacts(&local_cache_path)
+                        };
                         let is_active = {
                             let map = self.torrent_status.lock().unwrap();
                             map.get(&hash).map(|s| s.active).unwrap_or(false)
@@ -6444,20 +6940,15 @@ impl PanelRenderHelper for AppState {
                                         if uses_root_cache {
                                             ui.label(format!("./stream_cache/{}", torrent.dir_name));
                                         } else {
-                                            ui.label(format!(
-                                                "./stream_cache/{}/{}",
-                                                torrent.dir_name, opt.quality
-                                            ));
+                                            ui.label(local_cache_path.display().to_string());
                                         }
                                     });
 
                                     ui.horizontal(|ui| {
                                         ui.label(egui::RichText::new("Disk Space Used:").strong());
-                                        ui.label(format_size(get_payload_disk_space(&local_cache_path)));
+                                        ui.label(format_size(local_payload_disk));
                                     });
 
-                                    let local_control_disk =
-                                        get_control_disk_space(&local_cache_path);
                                     if local_control_disk > 0 {
                                         ui.horizontal(|ui| {
                                             ui.label(
@@ -6550,10 +7041,11 @@ impl PanelRenderHelper for AppState {
 		                                                    .color(egui::Color32::from_rgb(0, 220, 100))
 		                                                    .strong(),
 		                                                );
-		                                            } else if let Some((dl, total)) =
-		                                                get_live_downloaded_and_total(
-		                                                    &local_cache_path,
-                                                    parse_size_to_bytes(&opt.size),
+			                                            } else if let Some((dl, total)) =
+			                                                get_live_downloaded_and_total_excluding(
+			                                                    &local_cache_path,
+                                                    size_hint,
+                                                    &excluded_subdirs,
                                                 )
                                             {
                                                 let pct = if total > 0 {
@@ -6568,13 +7060,12 @@ impl PanelRenderHelper for AppState {
                                                     pct
                                                 ));
                                             } else {
-                                                ui.label(format_size(get_payload_disk_space(
-                                                    &local_cache_path,
-                                                )));
+                                                ui.label(format_size(local_payload_disk));
                                             }
-                                        } else if let Some((dl, total)) = get_live_downloaded_and_total(
+                                        } else if let Some((dl, total)) = get_live_downloaded_and_total_excluding(
                                             &local_cache_path,
-                                            parse_size_to_bytes(&opt.size),
+                                            size_hint,
+                                            &excluded_subdirs,
                                         ) {
                                             let pct = if total > 0 {
                                                 (dl as f64 / total as f64) * 100.0
@@ -6588,7 +7079,7 @@ impl PanelRenderHelper for AppState {
                                                 pct
                                             ));
                                         } else {
-                                            ui.label(format_size(get_payload_disk_space(&local_cache_path)));
+                                            ui.label(format_size(local_payload_disk));
                                         }
                                     });
                                     if let Some(detail) = option_startup_detail {
@@ -6675,8 +7166,7 @@ impl PanelRenderHelper for AppState {
                                             let url_to_play = opt.url.clone();
                                             let hash_clone = hash.clone();
                                             let title_for_launch = title.clone();
-                                            let quality_clone = opt.quality.clone();
-                                            let parent_dir_name = torrent.dir_name.clone();
+                                            let dest_dir = local_cache_path.clone();
                                             let size_hint = parse_size_to_bytes(&opt.size);
                                             let children_clone = self.spawned_children.clone();
                                             let torrent_status_clone = self.torrent_status.clone();
@@ -6684,23 +7174,11 @@ impl PanelRenderHelper for AppState {
 
                                             thread::spawn(move || {
                                                 let mut children = children_clone.lock().unwrap();
-                                                let dest = if uses_root_cache {
-                                                    format!("./stream_cache/{}", parent_dir_name)
-                                                } else {
-                                                    format!(
-                                                        "./stream_cache/{}/{}",
-                                                        parent_dir_name, quality_clone
-                                                    )
-                                                };
-                                                let dest_dir = PathBuf::from(&dest);
-                                                let local_torrent_path = if uses_root_cache {
-                                                    format!("./stream_cache/{}/movie.torrent", parent_dir_name)
-                                                } else {
-                                                    format!(
-                                                        "./stream_cache/{}/{}/movie.torrent",
-                                                        parent_dir_name, quality_clone
-                                                    )
-                                                };
+                                                let dest = dest_dir.to_string_lossy().to_string();
+                                                let local_torrent_path = dest_dir
+                                                    .join("movie.torrent")
+                                                    .to_string_lossy()
+                                                    .to_string();
                                                 let torrent_source = launch_source_from_url_or_hash(
                                                     &url_to_play,
                                                     &hash_clone,
