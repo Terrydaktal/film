@@ -125,6 +125,8 @@ local user_opts = {
     -- luacheck: pop
 }
 
+local torrent_safe_prefix_guard_bytes = 2 * 1024 * 1024
+
 for i = 1, 99 do
     user_opts["custom_button_" .. i .. "_content"] = ""
     user_opts["custom_button_" .. i .. "_mbtn_left_command"] = ""
@@ -486,8 +488,30 @@ local function torrent_progress_ranges()
         local capped_ranges = {}
         local is_complete = downloaded >= total
         local range_cap = 1
+        local safe_contiguous_prefix = contiguous_prefix
+        if not is_complete and safe_contiguous_prefix then
+            safe_contiguous_prefix = math.max(
+                0,
+                safe_contiguous_prefix - torrent_safe_prefix_guard_bytes
+            )
+        end
         if not is_complete and playable_prefix then
             range_cap = limit_range(0, 1, playable_prefix)
+        end
+        if not is_complete and safe_contiguous_prefix and safe_contiguous_prefix > 0 then
+            local range_end = math.min(
+                limit_range(0, 1, safe_contiguous_prefix / total),
+                range_cap
+            ) * 100
+            if range_end > 0 then
+                capped_ranges[#capped_ranges + 1] = {
+                    start = 0,
+                    ["end"] = range_end,
+                    byte_start = 0,
+                    byte_end = safe_contiguous_prefix,
+                }
+            end
+            return capped_ranges, total
         end
         for _, range in ipairs(ranges) do
             local range_start = limit_range(0, 1, range[1] / total) * 100

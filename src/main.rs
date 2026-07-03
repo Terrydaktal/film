@@ -138,21 +138,42 @@ fn slugify_cache_title(title: &str) -> String {
     }
 }
 
-fn cache_root_dir_name(title: &str, year: Option<u16>, hash: &str) -> String {
-    let mut display = title.trim().to_string();
-    if let Some(year) = year {
-        display.push_str(&format!("-{}", year));
-    }
-    let slug = slugify_cache_title(&display);
-    let clean_hash = hash
+fn filesystem_safe_title(title: &str) -> String {
+    let cleaned = title
         .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect::<String>()
-        .to_uppercase();
-    if clean_hash.len() == 40 {
-        format!("{}_{}", slug, clean_hash)
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect::<String>();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn cache_root_dir_name(title: &str, year: Option<u16>, hash: &str) -> String {
+    let mut display = filesystem_safe_title(title.trim());
+    if let Some(year) = year {
+        display = if display.is_empty() {
+            format!("({})", year)
+        } else {
+            format!("{} ({})", display, year)
+        };
+    }
+    if display.is_empty() {
+        let clean_hash = hash
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .collect::<String>()
+            .to_uppercase();
+        if clean_hash.len() == 40 {
+            clean_hash
+        } else {
+            slugify_cache_title(hash)
+        }
     } else {
-        format!("{}_{}", slug, hash)
+        display
     }
 }
 
@@ -170,6 +191,39 @@ fn cache_root_hash_from_dir_name(dir_name: &str) -> Option<String> {
         })
 }
 
+fn metadata_root_hash(metadata: Option<&MovieMetadata>) -> Option<String> {
+    let metadata = metadata?;
+    get_infohash(&metadata.url)
+        .or_else(|| get_infohash(&metadata.source_url))
+        .or_else(|| {
+            metadata.torrent_options.as_ref().and_then(|options| {
+                options
+                    .iter()
+                    .find_map(|opt| {
+                        get_infohash(&opt.url)
+                            .or_else(|| get_infohash(&opt.source_url))
+                            .or_else(|| {
+                                let hash = opt.hash.trim();
+                                (hash.len() == 40
+                                    && hash.chars().all(|c| c.is_ascii_hexdigit()))
+                                .then(|| hash.to_uppercase())
+                            })
+                    })
+            })
+        })
+}
+
+fn cache_root_hash(cache_dir: &std::path::Path, metadata: Option<&MovieMetadata>) -> Option<String> {
+    torrent_file_info_hash(cache_dir)
+        .or_else(|| metadata_root_hash(metadata))
+        .or_else(|| {
+            cache_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(cache_root_hash_from_dir_name)
+        })
+}
+
 fn torrent_option_cache_subdir(hash: &str) -> String {
     let clean_hash: String = hash
         .chars()
@@ -177,13 +231,13 @@ fn torrent_option_cache_subdir(hash: &str) -> String {
         .collect::<String>()
         .to_uppercase();
     if clean_hash.len() == 40 {
-        format!("option_{}", clean_hash)
+        clean_hash
     } else {
         let safe_hash: String = hash
             .chars()
             .map(|c| if matches!(c, '/' | '\\' | ':') { '_' } else { c })
             .collect();
-        format!("option_{}", safe_hash)
+        safe_hash
     }
 }
 
@@ -269,15 +323,16 @@ fn torrent_option_cache_path(
     hash: &str,
     size_hint: Option<u64>,
     allow_legacy_size_match: bool,
-    uses_root_cache: bool,
 ) -> PathBuf {
-    if uses_root_cache {
-        return parent_cache_path.to_path_buf();
-    }
-
     let hash_path = parent_cache_path.join(torrent_option_cache_subdir(hash));
     if hash_path.exists() {
         return hash_path;
+    }
+
+    let parent_hash_matches = torrent_file_info_hash(parent_cache_path)
+        .is_some_and(|parent_hash| parent_hash.eq_ignore_ascii_case(hash));
+    if parent_hash_matches {
+        return parent_cache_path.to_path_buf();
     }
 
     let legacy_quality_path = parent_cache_path.join(quality);
@@ -714,6 +769,9 @@ fn kill_managed_torrent_processes() {
         .status();
     let _ = Command::new("pkill")
         .args(["-9", "-i", "-f", "libtorrent_worker.py"])
+        .status();
+    let _ = Command::new("pkill")
+        .args(["-9", "-i", "-f", "torrent_stream_proxy.py"])
         .status();
 }
 
@@ -1733,8 +1791,7 @@ fn find_existing_cache_dir_for_movie(
         if existing_key != target_key {
             continue;
         }
-
-        let dir_hash = cache_root_hash_from_dir_name(&dir_name);
+        let dir_hash = cache_root_hash(&path, metadata.as_ref());
         let dir_matches = dir_hash
             .as_ref()
             .is_some_and(|hash| incoming_hashes.iter().any(|incoming| incoming == hash));
@@ -1751,6 +1808,7 @@ fn find_existing_cache_dir_for_movie(
         if dir_matches || option_matches {
             return Some(dir_name);
         }
+        return Some(dir_name);
     }
 
     None
@@ -1825,15 +1883,6 @@ fn get_folder_disk_space_filtered(
 
 fn get_folder_disk_space(dir: &std::path::Path) -> u64 {
     get_folder_disk_space_filtered(dir, &|_| true)
-}
-
-fn get_folder_disk_space_excluding(
-    dir: &std::path::Path,
-    excluded_direct_children: &[String],
-) -> u64 {
-    get_folder_disk_space_filtered(dir, &|path| {
-        !is_under_excluded_direct_child(dir, path, excluded_direct_children)
-    })
 }
 
 fn get_payload_disk_space(dir: &std::path::Path) -> u64 {
@@ -2243,6 +2292,77 @@ fn progress_file_path(dest_dir: &std::path::Path) -> PathBuf {
     }
 }
 
+fn python_tool_command(script_relative_path: &str) -> Command {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let venv_python = cwd.join(".venv").join("bin").join("python");
+    let home_uv = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".local").join("bin").join("uv"));
+
+    if venv_python.exists() {
+        let mut cmd = Command::new(venv_python);
+        cmd.arg(cwd.join(script_relative_path));
+        cmd
+    } else if let Some(home_uv) = home_uv.filter(|path| path.exists()) {
+        let mut cmd = Command::new(home_uv);
+        cmd.env("UV_CACHE_DIR", "/data/.cache/uv");
+        cmd.args(["run", "python"]);
+        cmd.arg(cwd.join(script_relative_path));
+        cmd
+    } else {
+        let mut cmd = Command::new("uv");
+        cmd.env("UV_CACHE_DIR", "/data/.cache/uv");
+        cmd.args(["run", "python"]);
+        cmd.arg(cwd.join(script_relative_path));
+        cmd
+    }
+}
+
+fn wait_for_local_http_proxy(port: u16, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+fn ensure_complete_progress_snapshot_for_existing_media(
+    media_path: &std::path::Path,
+    progress_file: &std::path::Path,
+) {
+    if progress_file.exists() {
+        return;
+    }
+    let total_bytes = match fs::metadata(media_path) {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return,
+    };
+    if total_bytes == 0 {
+        return;
+    }
+    if let Some(parent) = progress_file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let progress_json = serde_json::json!({
+        "downloaded_bytes": total_bytes,
+        "total_bytes": total_bytes,
+        "contiguous_prefix_bytes": total_bytes,
+        "piece_verified_bytes": total_bytes,
+        "startup_window_bytes": 0,
+        "startup_window_downloaded_bytes": 0,
+        "startup_window_complete": true,
+        "complete": true,
+        "range_source": "legacy_local_file_fallback",
+        "ranges": [[0, total_bytes]],
+    });
+    if let Ok(content) = serde_json::to_string(&progress_json) {
+        let _ = fs::write(progress_file, content);
+    }
+}
+
 
 
 fn direct_mpv_args(progress_file: &std::path::Path) -> Vec<String> {
@@ -2263,6 +2383,47 @@ fn direct_mpv_args(progress_file: &std::path::Path) -> Vec<String> {
     args.push("--slang=en,eng,english".to_string());
 
     args
+}
+
+fn launch_mpv(
+    spawned_children: &Arc<Mutex<Vec<std::process::Child>>>,
+    media_path: &std::path::Path,
+    progress_file: &std::path::Path,
+) -> Result<(), String> {
+    ensure_complete_progress_snapshot_for_existing_media(media_path, progress_file);
+    let proxy_port = get_free_port().ok_or_else(|| "failed to allocate local proxy port".to_string())?;
+    let mut proxy_cmd = python_tool_command("tools/torrent_stream_proxy.py");
+    proxy_cmd
+        .arg("--media-path")
+        .arg(media_path)
+        .arg("--progress-file")
+        .arg(progress_file)
+        .arg("--port")
+        .arg(proxy_port.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    let proxy_child = proxy_cmd.spawn().map_err(|err| err.to_string())?;
+    {
+        spawned_children.lock().unwrap().push(proxy_child);
+    }
+    if !wait_for_local_http_proxy(proxy_port, Duration::from_secs(2)) {
+        return Err(format!(
+            "local stream proxy did not start on 127.0.0.1:{}",
+            proxy_port
+        ));
+    }
+
+    let mut cmd = Command::new("mpv");
+    cmd.args(direct_mpv_args(progress_file));
+    cmd.arg(format!("http://127.0.0.1:{}/stream", proxy_port));
+    match cmd.spawn() {
+        Ok(child) => {
+            spawned_children.lock().unwrap().push(child);
+            Ok(())
+        }
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 fn default_found_count() -> u32 {
@@ -3768,16 +3929,25 @@ fn initialize_torrent_runtime_state(
     );
 }
 
+fn movie_runtime_label(metadata: Option<&MovieMetadata>) -> Option<&str> {
+    metadata
+        .and_then(|meta| meta.duration.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 fn group_sidebar_progress_text(group: &MovieGroup) -> String {
     let mut entries = Vec::new();
 
     for torrent in &group.torrents {
         let cache_dir_path = get_cache_dir().join(&torrent.dir_name);
-        let root_hash = cache_root_hash_from_dir_name(&torrent.dir_name);
-        let option_cache_markers: Vec<(String, String, String)> = torrent
+        let torrent_options = torrent
             .metadata
             .as_ref()
             .and_then(|meta| meta.torrent_options.as_ref())
+            .cloned();
+        let option_cache_markers: Vec<(String, String, String)> = torrent_options
+            .as_ref()
             .map(|options| {
                 options
                     .iter()
@@ -3792,16 +3962,11 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
                     .collect()
             })
             .unwrap_or_default();
-        let root_excluded_subdirs = root_hash
-            .as_ref()
-            .map(|hash| sibling_option_cache_subdirs(&option_cache_markers, hash))
-            .unwrap_or_default();
-        if let Some((downloaded, total)) = get_torrent_downloaded_and_total(&cache_dir_path) {
+        if torrent_options.as_ref().is_none_or(|options| options.is_empty())
+            && let Some((downloaded, total)) = get_torrent_downloaded_and_total(&cache_dir_path)
+        {
             let live_downloaded = downloaded
-                .max(get_payload_disk_space_excluding(
-                    &cache_dir_path,
-                    &root_excluded_subdirs,
-                ))
+                .max(get_payload_disk_space(&cache_dir_path))
                 .min(total);
             let pct = if total > 0 {
                 (live_downloaded as f64 / total as f64) * 100.0
@@ -3816,14 +3981,10 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
             ));
         }
 
-        if let Some(ref meta) = torrent.metadata {
-            if let Some(ref options) = meta.torrent_options {
-                for opt in options {
+        if let Some(ref options) = torrent_options {
+            for opt in options {
                     let hash = opt.hash.to_uppercase();
                     let size_hint = parse_size_to_bytes(&opt.size);
-                    let uses_root_cache = root_hash
-                        .as_ref()
-                        .is_some_and(|root| root.eq_ignore_ascii_case(&hash));
                     let allow_legacy_size_match = legacy_cache_size_best_matches_option(
                         &cache_dir_path.join(&opt.quality),
                         &hash,
@@ -3837,8 +3998,8 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
                         &hash,
                         size_hint,
                         allow_legacy_size_match,
-                        uses_root_cache,
                     );
+                    let uses_root_cache = option_path == cache_dir_path;
                     let excluded_subdirs = if uses_root_cache {
                         sibling_option_cache_subdirs(&option_cache_markers, &hash)
                     } else {
@@ -3870,7 +4031,6 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
                         ));
                     }
                 }
-            }
         }
     }
 
@@ -3885,30 +4045,16 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
         .iter()
         .map(|torrent| {
             let cache_dir_path = get_cache_dir().join(&torrent.dir_name);
-            let root_hash = cache_root_hash_from_dir_name(&torrent.dir_name);
-            let option_cache_markers: Vec<(String, String, String)> = torrent
+            if torrent
                 .metadata
                 .as_ref()
                 .and_then(|meta| meta.torrent_options.as_ref())
-                .map(|options| {
-                    options
-                        .iter()
-                        .map(|opt| {
-                            let hash = opt.hash.to_uppercase();
-                            (
-                                hash.clone(),
-                                opt.quality.clone(),
-                                torrent_option_cache_subdir(&hash),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let excluded_subdirs = root_hash
-                .as_ref()
-                .map(|hash| sibling_option_cache_subdirs(&option_cache_markers, hash))
-                .unwrap_or_default();
-            get_folder_disk_space_excluding(&cache_dir_path, &excluded_subdirs)
+                .is_some_and(|options| !options.is_empty())
+            {
+                0
+            } else {
+                get_folder_disk_space(&cache_dir_path)
+            }
         })
         .sum();
     format!("0 B ({})", format_size(live_disk_used))
@@ -5122,11 +5268,10 @@ impl eframe::App for AppState {
                              };
  
                              // Find the highest download percentage and check if complete
-                             let mut max_pct = 0.0;
-	                             let mut is_complete = false;
-	                             for t in &group.torrents {
-	                                 let cache_dir_path = get_cache_dir().join(&t.dir_name);
-                                     let root_hash = cache_root_hash_from_dir_name(&t.dir_name);
+	                             let mut max_pct = 0.0;
+		                             let mut is_complete = false;
+		                             for t in &group.torrents {
+		                                 let cache_dir_path = get_cache_dir().join(&t.dir_name);
                                      let option_cache_markers: Vec<(String, String, String)> = t
                                          .metadata
                                          .as_ref()
@@ -5145,14 +5290,11 @@ impl eframe::App for AppState {
                                                  .collect()
                                          })
                                          .unwrap_or_default();
-	                                 if let Some(ref meta) = t.metadata {
-	                                     if let Some(ref options) = meta.torrent_options {
-	                                         for opt in options {
+		                                 if let Some(ref meta) = t.metadata {
+		                                     if let Some(ref options) = meta.torrent_options {
+		                                         for opt in options {
                                                  let hash = opt.hash.to_uppercase();
                                                  let size_hint = parse_size_to_bytes(&opt.size);
-	                                                 let uses_root_cache = root_hash
-	                                                     .as_ref()
-	                                                     .is_some_and(|root| root.eq_ignore_ascii_case(&hash));
                                                  let allow_legacy_size_match =
                                                      legacy_cache_size_best_matches_option(
                                                          &cache_dir_path.join(&opt.quality),
@@ -5167,8 +5309,8 @@ impl eframe::App for AppState {
 	                                                     &hash,
 	                                                     size_hint,
                                                      allow_legacy_size_match,
-	                                                     uses_root_cache,
 	                                                 );
+                                                 let uses_root_cache = option_path == cache_dir_path;
                                                  let excluded_subdirs = if uses_root_cache {
                                                      sibling_option_cache_subdirs(
                                                          &option_cache_markers,
@@ -5192,22 +5334,22 @@ impl eframe::App for AppState {
                                                      }
                                                  }
                                              }
-                                         }
-	                                     }
-	                                 }
-                                     let root_excluded_subdirs = root_hash
+		                                         }
+		                                     }
+		                                 }
+		                                 if t
+                                         .metadata
                                          .as_ref()
-                                         .map(|hash| {
-                                             sibling_option_cache_subdirs(&option_cache_markers, hash)
-                                         })
-                                         .unwrap_or_default();
-	                                 if let Some((dl, tot)) = get_live_downloaded_and_total_excluding(
-                                         &cache_dir_path,
-                                         Some(t.logical_size_bytes),
-                                         &root_excluded_subdirs,
-                                     ) {
-	                                     if tot > 0 {
-	                                         let pct = (dl as f64 / tot as f64) * 100.0;
+                                         .and_then(|meta| meta.torrent_options.as_ref())
+                                         .is_none_or(|options| options.is_empty())
+                                         && let Some((dl, tot)) = get_live_downloaded_and_total_excluding(
+                                             &cache_dir_path,
+                                             Some(t.logical_size_bytes),
+                                             &[],
+                                         )
+                                     {
+		                                     if tot > 0 {
+		                                         let pct = (dl as f64 / tot as f64) * 100.0;
                                          if pct > max_pct {
                                              max_pct = pct;
                                          }
@@ -5584,7 +5726,10 @@ impl eframe::App for AppState {
                                                 }
                                             });
                                             let manual_title = get_infohash(&url)
-                                                .map(|_| "manual-torrent".to_string())
+                                                .map(|full_hash| {
+                                                    let short_hash = full_hash.chars().take(12).collect::<String>();
+                                                    format!("manual-torrent {}", short_hash)
+                                                })
                                                 .unwrap_or_else(|| hash.clone());
                                             let dir_name =
                                                 cache_root_dir_name(&manual_title, None, &hash);
@@ -5791,19 +5936,29 @@ impl eframe::App for AppState {
                                                             .map(|t| t.hash.to_uppercase())
                                                             .collect();
                                                         let film_key = normalize_film_key(&movie.title, movie.year);
-                                                        let dir_name = find_existing_cache_dir_for_movie(
+                                                        let desired_dir_name = cache_root_dir_name(
+                                                            &movie.title,
+                                                            movie.year,
+                                                            &first_hash,
+                                                        );
+                                                        let mut dir_name = find_existing_cache_dir_for_movie(
                                                             &movie.title,
                                                             movie.year,
                                                             &incoming_hashes,
                                                         )
-                                                        .unwrap_or_else(|| {
-                                                            cache_root_dir_name(
-                                                                &movie.title,
-                                                                movie.year,
-                                                                &first_hash,
-                                                            )
-                                                        });
-                                                        let dest_dir = get_cache_dir().join(&dir_name);
+                                                        .unwrap_or_else(|| desired_dir_name.clone());
+                                                        let cache_root = get_cache_dir();
+                                                        let mut dest_dir = cache_root.join(&dir_name);
+                                                        let desired_dest_dir = cache_root.join(&desired_dir_name);
+                                                        if dir_name != desired_dir_name
+                                                            && dest_dir.exists()
+                                                            && !desired_dest_dir.exists()
+                                                        {
+                                                            if fs::rename(&dest_dir, &desired_dest_dir).is_ok() {
+                                                                dir_name = desired_dir_name.clone();
+                                                                dest_dir = desired_dest_dir;
+                                                            }
+                                                        }
                                                         let _ = fs::create_dir_all(&dest_dir);
 
                                                         let display_title = match movie.year {
@@ -6031,7 +6186,7 @@ impl PanelRenderHelper for AppState {
         // Quality Option Buttons at the top (from metadata.torrent_options)
         if let Some(torrent) = primary_torrent.clone() {
             let parent_cache_path = get_cache_dir().join(&torrent.dir_name);
-            let root_hash = cache_root_hash_from_dir_name(&torrent.dir_name);
+            let root_hash = cache_root_hash(&parent_cache_path, torrent.metadata.as_ref());
             let torrent_options = torrent
                 .metadata
                 .as_ref()
@@ -6068,16 +6223,9 @@ impl PanelRenderHelper for AppState {
                 get_control_disk_space_excluding(&parent_cache_path, &root_excluded_subdirs);
             let root_has_cache_artifacts = root_payload_disk > 0 || root_control_disk > 0;
             let has_torrent_options = torrent_options.as_ref().is_some_and(|options| !options.is_empty());
-            let root_status_bound_to_option = torrent_options.as_ref().is_some_and(|options| {
-                root_hash.as_ref().is_some_and(|hash| {
-                    options
-                        .iter()
-                        .any(|opt| opt.hash.eq_ignore_ascii_case(hash))
-                })
-            });
             let root_has_local_status =
                 root_has_torrent || root_media.is_some() || root_is_active || root_has_cache_artifacts;
-            if root_has_local_status && (!has_torrent_options || !root_status_bound_to_option) {
+            if root_has_local_status && !has_torrent_options {
                 ui.label(egui::RichText::new("Quality Options Local Status:").strong());
                 ui.add_space(6.0);
                 ui.group(|ui| {
@@ -6273,6 +6421,12 @@ impl PanelRenderHelper for AppState {
                                 ui.label(egui::RichText::new("Largest Media File:").strong());
                                 ui.label(path.file_name().unwrap_or_default().to_string_lossy());
                             });
+                            if let Some(runtime) = movie_runtime_label(torrent.metadata.as_ref()) {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Runtime:").strong());
+                                    ui.label(runtime);
+                                });
+                            }
                             render_torrent_file_progress_dropdown(ui, &parent_cache_path);
                         }
 
@@ -6344,7 +6498,7 @@ impl PanelRenderHelper for AppState {
                                 if let Some(sequential_mode) = start_mode {
 	                                    let url_to_play = torrent.metadata.as_ref().map(|m| m.url.clone()).unwrap_or_default();
                                         let root_hash_for_launch =
-                                            cache_root_hash_from_dir_name(&torrent.dir_name)
+                                            cache_root_hash(&get_cache_dir().join(&torrent.dir_name), torrent.metadata.as_ref())
                                                 .unwrap_or_default();
                                     let dir_to_play = torrent.dir_name.clone();
                                     let children_clone = self.spawned_children.clone();
@@ -6439,18 +6593,21 @@ impl PanelRenderHelper for AppState {
                                     .fill(egui::Color32::from_rgb(0, 120, 200)),
                                 );
                                 if play_local_btn.clicked() {
-                                    let path_str = media_path.to_str().unwrap_or_default().to_string();
                                     let progress_file = progress_file_path(&parent_cache_path);
-                                    let children_clone = self.spawned_children.clone();
-                                    thread::spawn(move || {
-                                        let mut cmd = Command::new("mpv");
-                                        cmd.args(direct_mpv_args(&progress_file));
-                                        cmd.arg(&path_str);
-                                        if let Ok(child) = cmd.spawn() {
-                                            children_clone.lock().unwrap().push(child);
+                                    match launch_mpv(
+                                        &self.spawned_children,
+                                        &media_path,
+                                        &progress_file,
+                                    ) {
+                                        Ok(()) => {
+                                            self.status_message =
+                                                "Opened local file in mpv.".to_string();
                                         }
-                                    });
-                                    self.status_message = "Opened local file in mpv.".to_string();
+                                        Err(err) => {
+                                            self.status_message =
+                                                format!("Failed to open local file in mpv: {err}");
+                                        }
+                                    }
                                 }
 
                                 let delete_file_btn = ui.add_sized(
@@ -6489,9 +6646,6 @@ impl PanelRenderHelper for AppState {
                     options.sort_by_key(|opt| {
                         let hash = opt.hash.to_uppercase();
                         let size_hint = parse_size_to_bytes(&opt.size);
-                        let uses_root_cache = root_hash
-                            .as_ref()
-                            .is_some_and(|root| root.eq_ignore_ascii_case(&hash));
                         let allow_legacy_size_match = legacy_cache_size_best_matches_option(
                             &parent_cache_path.join(&opt.quality),
                             &hash,
@@ -6505,8 +6659,8 @@ impl PanelRenderHelper for AppState {
                             &hash,
                             size_hint,
                             allow_legacy_size_match,
-                            uses_root_cache,
                         );
+                        let uses_root_cache = local_cache_path == parent_cache_path;
                         let excluded_subdirs = if uses_root_cache {
                             sibling_option_cache_subdirs(&option_cache_markers, &hash)
                         } else {
@@ -6540,9 +6694,6 @@ impl PanelRenderHelper for AppState {
                     for opt in options {
                         let hash = opt.hash.to_uppercase();
                         let size_hint = parse_size_to_bytes(&opt.size);
-                        let uses_root_cache = root_hash
-                            .as_ref()
-                            .is_some_and(|root| root.eq_ignore_ascii_case(&hash));
                         let allow_legacy_size_match = legacy_cache_size_best_matches_option(
                             &parent_cache_path.join(&opt.quality),
                             &hash,
@@ -6556,8 +6707,8 @@ impl PanelRenderHelper for AppState {
                             &hash,
                             size_hint,
                             allow_legacy_size_match,
-                            uses_root_cache,
                         );
+                        let uses_root_cache = local_cache_path == parent_cache_path;
                         let excluded_subdirs = if uses_root_cache {
                             sibling_option_cache_subdirs(&option_cache_markers, &hash)
                         } else {
@@ -6788,6 +6939,14 @@ impl PanelRenderHelper for AppState {
                                             ui.label(egui::RichText::new("Largest Media File:").strong());
                                             ui.label(path.file_name().unwrap_or_default().to_string_lossy());
                                         });
+                                        if let Some(runtime) =
+                                            movie_runtime_label(torrent.metadata.as_ref())
+                                        {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Runtime:").strong());
+                                                ui.label(runtime);
+                                            });
+                                        }
                                         render_torrent_file_progress_dropdown(ui, &local_cache_path);
                                     }
                                 }
@@ -6960,29 +7119,26 @@ impl PanelRenderHelper for AppState {
                                         );
                                         if play_local_btn.clicked() {
                                             if let Some(ref media_path) = local_media {
-                                                let path_str = media_path
-                                                    .to_str()
-                                                    .unwrap_or_default()
-                                                    .to_string();
                                                 let progress_file =
                                                     progress_file_path(&local_cache_path);
-                                                let children_clone =
-                                                    self.spawned_children.clone();
-                                                thread::spawn(move || {
-                                                    let mut cmd = Command::new("mpv");
-                                                    cmd.args(direct_mpv_args(&progress_file));
-                                                    cmd.arg(&path_str);
-                                                    if let Ok(child) = cmd.spawn() {
-                                                        children_clone
-                                                            .lock()
-                                                            .unwrap()
-                                                            .push(child);
+                                                match launch_mpv(
+                                                    &self.spawned_children,
+                                                    media_path,
+                                                    &progress_file,
+                                                ) {
+                                                    Ok(()) => {
+                                                        self.status_message = format!(
+                                                            "Opened {} local file in mpv.",
+                                                            opt.quality
+                                                        );
                                                     }
-                                                });
-                                                self.status_message = format!(
-                                                    "Opened {} local file in mpv.",
-                                                    opt.quality
-                                                );
+                                                    Err(err) => {
+                                                        self.status_message = format!(
+                                                            "Failed to open {} local file in mpv: {}",
+                                                            opt.quality, err
+                                                        );
+                                                    }
+                                                }
                                             }
                                         }
 
