@@ -10,6 +10,22 @@ from pathlib import Path
 
 import libtorrent as lt
 
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".m4v",
+    ".mov",
+    ".flv",
+    ".webm",
+}
+
+DEFAULT_FILE_PRIORITY = 4
+LOW_FILE_PRIORITY = 1
+HIGH_FILE_PRIORITY = 7
+DEFAULT_PIECE_PRIORITY = 4
+HIGH_PIECE_PRIORITY = 7
+
 
 def format_size(num_bytes: int) -> str:
     kb = 1024
@@ -117,6 +133,25 @@ def english_subtitle_file_indexes(handle: lt.torrent_handle):
     return matches
 
 
+def primary_media_file_index(handle: lt.torrent_handle):
+    torrent_info = handle.torrent_file()
+    if torrent_info is None:
+        return None
+    files = torrent_info.files()
+    largest_index = None
+    largest_size = -1
+    for index in range(files.num_files()):
+        path = files.file_path(index).lower()
+        suffix = Path(path).suffix
+        if suffix not in VIDEO_EXTENSIONS:
+            continue
+        size = int(files.file_size(index))
+        if size > largest_size:
+            largest_size = size
+            largest_index = index
+    return largest_index
+
+
 def apply_english_subtitle_priority(handle: lt.torrent_handle, prioritize_subs: bool):
     torrent_info = handle.torrent_file()
     if torrent_info is None:
@@ -131,6 +166,149 @@ def apply_english_subtitle_priority(handle: lt.torrent_handle, prioritize_subs: 
         for index in subtitle_indexes:
             priorities[index] = 7
     handle.prioritize_files(priorities)
+
+
+def build_primary_media_layout(handle: lt.torrent_handle, target_bytes: int):
+    torrent_info = handle.torrent_file()
+    if torrent_info is None:
+        return None
+    files = torrent_info.files()
+    file_index = primary_media_file_index(handle)
+    if file_index is None or file_index < 0 or file_index >= files.num_files():
+        return None
+    file_offset = 0
+    for index in range(file_index):
+        file_offset += int(files.file_size(index))
+    file_size = int(files.file_size(file_index))
+    if file_size <= 0 or target_bytes <= 0:
+        return None
+    total_size = 0
+    for index in range(files.num_files()):
+        total_size += int(files.file_size(index))
+    piece_length = int(torrent_info.piece_length())
+    first_piece = file_offset // piece_length
+    last_piece = (file_offset + file_size - 1) // piece_length
+    piece_spans = []
+    for piece in range(first_piece, last_piece + 1):
+        piece_start = piece * piece_length
+        piece_end = min(piece_start + piece_length, total_size)
+        overlap_start = max(piece_start, file_offset)
+        overlap_end = min(piece_end, file_offset + file_size)
+        if overlap_start >= overlap_end:
+            continue
+        piece_spans.append((piece, overlap_start - file_offset, overlap_end - file_offset))
+    window_bytes = min(file_size, target_bytes)
+    return {
+        "file_index": file_index,
+        "file_size": file_size,
+        "startup_window_bytes": window_bytes,
+        "piece_spans": piece_spans,
+    }
+
+
+def apply_startup_piece_priority(handle: lt.torrent_handle, layout):
+    torrent_info = handle.torrent_file()
+    if torrent_info is None:
+        return None
+    if layout is None:
+        return None
+    startup_window_bytes = int(layout.get("startup_window_bytes", 0))
+    startup_pieces = [
+        piece
+        for piece, rel_start, _rel_end in layout.get("piece_spans", [])
+        if rel_start < startup_window_bytes
+    ]
+    if not startup_pieces:
+        return None
+    try:
+        priorities = [DEFAULT_PIECE_PRIORITY] * torrent_info.num_pieces()
+        for piece in startup_pieces:
+            priorities[piece] = HIGH_PIECE_PRIORITY
+        handle.prioritize_pieces(priorities)
+        return len(startup_pieces), startup_window_bytes
+    except Exception:
+        return None
+
+
+def clear_startup_piece_priority(handle: lt.torrent_handle):
+    torrent_info = handle.torrent_file()
+    if torrent_info is None:
+        return
+    try:
+        handle.prioritize_pieces([DEFAULT_PIECE_PRIORITY] * torrent_info.num_pieces())
+    except Exception:
+        pass
+
+
+def merge_ranges(ranges):
+    if not ranges:
+        return []
+    ranges = sorted(ranges, key=lambda item: item[0])
+    merged = [list(ranges[0])]
+    for start, end in ranges[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def write_piece_progress(handle: lt.torrent_handle, save_path: Path, layout):
+    if layout is None:
+        return None
+    completed_ranges = []
+    contiguous_prefix = 0
+    verified_bytes = 0
+    for piece, rel_start, rel_end in layout.get("piece_spans", []):
+        try:
+            have_piece = handle.have_piece(piece)
+        except Exception:
+            have_piece = False
+        if have_piece:
+            completed_ranges.append((rel_start, rel_end))
+            verified_bytes += rel_end - rel_start
+    merged_ranges = merge_ranges(completed_ranges)
+    if merged_ranges and merged_ranges[0][0] == 0:
+        contiguous_prefix = merged_ranges[0][1]
+    startup_window_bytes = int(layout.get("startup_window_bytes", 0))
+    startup_window_downloaded = min(contiguous_prefix, startup_window_bytes)
+    startup_window_complete = (
+        startup_window_bytes > 0 and contiguous_prefix >= startup_window_bytes
+    )
+    progress_path = save_path / ".torrent_progress.json"
+    try:
+        if progress_path.exists():
+            progress_json = json.loads(progress_path.read_text())
+            if not isinstance(progress_json, dict):
+                progress_json = {}
+        else:
+            progress_json = {}
+    except Exception:
+        progress_json = {}
+    progress_json.update(
+        {
+            "verifier_version": 3,
+            "range_source": "libtorrent_piece_map",
+            "total_bytes": int(layout.get("file_size", 0)),
+            "contiguous_prefix_bytes": contiguous_prefix,
+            "piece_verified_bytes": verified_bytes,
+            "startup_window_bytes": startup_window_bytes,
+            "startup_window_downloaded_bytes": startup_window_downloaded,
+            "startup_window_complete": startup_window_complete,
+            "ranges": [[start, end] for start, end in merged_ranges],
+        }
+    )
+    try:
+        progress_path.write_text(json.dumps(progress_json, ensure_ascii=True))
+    except Exception as exc:
+        emit(
+            {
+                "event": "log",
+                "level": "warn",
+                "message": f"piece progress save failed: {exc}",
+            }
+        )
+    return startup_window_downloaded, startup_window_bytes, startup_window_complete
 
 
 def build_session() -> lt.session:
@@ -196,6 +374,7 @@ def main() -> int:
     parser.add_argument("--save-path", required=True)
     parser.add_argument("--display-name", required=True)
     parser.add_argument("--sequential", action="store_true")
+    parser.add_argument("--sequential-start-mib", type=float, default=0.0)
     args = parser.parse_args()
 
     save_path = Path(args.save_path)
@@ -221,6 +400,9 @@ def main() -> int:
     tracker_connection_failures = 0
     port_forwarding_unavailable = 0
     subtitle_priority_active = False
+    startup_piece_priority_active = False
+    startup_piece_window_bytes = 0
+    primary_media_layout = None
 
     def request_stop(signum, frame):
         nonlocal stop_requested
@@ -276,8 +458,40 @@ def main() -> int:
             metadata_saved = torrent_path.exists()
 
         file_progress_totals = None
+        startup_window_state = None
         if status.has_metadata:
+            if args.sequential and args.sequential_start_mib > 0 and primary_media_layout is None:
+                primary_media_layout = build_primary_media_layout(
+                    handle,
+                    int(args.sequential_start_mib * 1024 * 1024),
+                )
+            if (
+                args.sequential
+                and args.sequential_start_mib > 0
+                and not startup_piece_priority_active
+                and primary_media_layout is not None
+            ):
+                window = apply_startup_piece_priority(handle, primary_media_layout)
+                if window is not None:
+                    startup_piece_priority_active = True
+                    _, startup_piece_window_bytes = window
+                    emit(
+                        {
+                            "event": "log",
+                            "level": "info",
+                            "message": (
+                                "prioritizing the first "
+                                f"{format_size(startup_piece_window_bytes)} of the main video file"
+                            ),
+                        }
+                    )
             file_progress_totals = save_file_progress(handle, save_path)
+            if primary_media_layout is not None:
+                startup_window_state = write_piece_progress(
+                    handle,
+                    save_path,
+                    primary_media_layout,
+                )
             subtitle_indexes = english_subtitle_file_indexes(handle)
             if subtitle_indexes:
                 files = handle.torrent_file().files()
@@ -291,6 +505,23 @@ def main() -> int:
                 elif subtitles_complete and subtitle_priority_active:
                     apply_english_subtitle_priority(handle, False)
                     subtitle_priority_active = False
+            if (
+                startup_piece_priority_active
+                and primary_media_layout is not None
+                and startup_piece_window_bytes > 0
+                and startup_window_state is not None
+            ):
+                _, _, startup_window_complete = startup_window_state
+                if startup_window_complete:
+                    clear_startup_piece_priority(handle)
+                    startup_piece_priority_active = False
+                    emit(
+                        {
+                            "event": "log",
+                            "level": "info",
+                            "message": "startup piece prioritization finished; continuing with normal sequential order",
+                        }
+                    )
 
         if file_progress_totals is not None:
             downloaded, total = file_progress_totals
@@ -318,6 +549,23 @@ def main() -> int:
             speed = format_rate(status.download_rate)
             detail = ""
             complete = False
+
+        if (
+            args.sequential
+            and startup_window_state is not None
+            and startup_window_state[1] > 0
+            and not startup_window_state[2]
+            and speed != "Complete"
+        ):
+            startup_progress_text = (
+                f"startup window {format_size(startup_window_state[0])} / "
+                f"{format_size(startup_window_state[1])}"
+            )
+            detail = (
+                f"{detail}; {startup_progress_text}"
+                if detail
+                else startup_progress_text
+            )
 
         peers_text = "connecting" if status.num_peers <= 0 else f"{status.num_peers} peers"
         downloaded_text = (

@@ -3,12 +3,12 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::{BufRead, Read};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct TorrentOption {
@@ -113,8 +113,6 @@ enum BValue {
     List(Vec<BValue>),
     Dict(std::collections::BTreeMap<Vec<u8>, BValue>),
 }
-
-const PROGRESS_VERIFIER_VERSION: u64 = 2;
 
 fn get_cache_dir() -> PathBuf {
     PathBuf::from("./stream_cache")
@@ -661,6 +659,7 @@ fn build_libtorrent_worker_command(
     save_path: &str,
     display_name: &str,
     sequential: bool,
+    sequential_start_mib: Option<u32>,
 ) -> Command {
     let worker_path = libtorrent_worker_path();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -697,6 +696,9 @@ fn build_libtorrent_worker_command(
     ]);
     if sequential {
         cmd.arg("--sequential");
+    }
+    if let Some(start_mib) = sequential_start_mib.filter(|start_mib| *start_mib > 0) {
+        cmd.args(["--sequential-start-mib", &start_mib.to_string()]);
     }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -915,72 +917,6 @@ where
             }
         }
     });
-}
-
-const MIN_LOCAL_PLAY_CONTIGUOUS_BYTES: u64 = 10 * 1024 * 1024;
-
-fn get_verified_local_playback_state(
-    cache_dir: &std::path::Path,
-) -> Option<(u64, u64, Option<f64>)> {
-    let progress_file = progress_file_path(cache_dir);
-    let content = fs::read_to_string(progress_file).ok()?;
-    let val = serde_json::from_str::<serde_json::Value>(&content).ok()?;
-    let contiguous_prefix = val
-        .get("contiguous_prefix_bytes")
-        .and_then(|v| v.as_u64())?;
-    let total = val.get("total_bytes").and_then(|v| v.as_u64())?;
-    let playable_prefix = val.get("playable_prefix_ratio").and_then(|v| v.as_f64());
-    Some((contiguous_prefix, total, playable_prefix))
-}
-
-fn local_playback_guard(
-    cache_dir: &std::path::Path,
-    media_path: &std::path::Path,
-) -> Result<(), String> {
-    write_verified_torrent_progress_with_mode(cache_dir, media_path, true);
-    let verified_state = get_verified_local_playback_state(cache_dir);
-    let fallback_state = get_torrent_downloaded_and_total(cache_dir);
-    let ((contiguous_prefix, total), playable_prefix, used_fallback) = if let Some((contiguous_prefix, total, playable_prefix)) = verified_state {
-        ((contiguous_prefix, total), playable_prefix, false)
-    } else if let Some((downloaded_bytes, total)) = fallback_state {
-        ((downloaded_bytes, total), None, true)
-    } else {
-        return Err("Local playback verification is unavailable for this file yet.".to_string());
-    };
-
-    if total == 0 {
-        return Err("Local playback verification reported an empty media file.".to_string());
-    }
-
-    if contiguous_prefix >= total {
-        return Ok(());
-    }
-
-    let min_required = MIN_LOCAL_PLAY_CONTIGUOUS_BYTES.min(total);
-    if contiguous_prefix >= min_required {
-        return Ok(());
-    }
-
-    if mpv_can_start_at_ratio(media_path, 0.0) {
-        return Ok(());
-    }
-
-    let contiguous_mib = contiguous_prefix as f64 / (1024.0 * 1024.0);
-    let required_mib = min_required as f64 / (1024.0 * 1024.0);
-    let percent = (contiguous_prefix as f64 / total as f64) * 100.0;
-    let playable_hint = playable_prefix
-        .map(|ratio| format!(" Playable probe: {:.0}%.", ratio * 100.0))
-        .unwrap_or_default();
-    let verification_hint = if used_fallback {
-        " Verified contiguous-range data is still warming up; using raw downloaded-byte fallback."
-    } else {
-        ""
-    };
-
-    Err(format!(
-        "Refusing local playback: only the first {:.0} MiB ({:.1}%) is available from the start; need at least {:.0} MiB from the start.{}{}",
-        contiguous_mib, percent, required_mib, playable_hint, verification_hint
-    ))
 }
 
 fn torrent_info_name(cache_dir: &std::path::Path) -> Option<String> {
@@ -2119,7 +2055,6 @@ fn bvalue_dict(value: &BValue) -> Option<&std::collections::BTreeMap<Vec<u8>, BV
 #[derive(Clone)]
 struct TorrentFileEntry {
     path: PathBuf,
-    start: u64,
     len: u64,
 }
 
@@ -2148,14 +2083,12 @@ fn torrent_files_from_info(
     if let Some(length) = bdict_get(info, b"length").and_then(bvalue_int) {
         return Some(vec![TorrentFileEntry {
             path: cache_dir.join(name),
-            start: 0,
             len: length,
         }]);
     }
 
     let files = bdict_get(info, b"files").and_then(bvalue_list)?;
     let mut entries = Vec::new();
-    let mut offset = 0;
 
     for file_value in files {
         let file = bvalue_dict(file_value)?;
@@ -2169,10 +2102,8 @@ fn torrent_files_from_info(
 
         entries.push(TorrentFileEntry {
             path,
-            start: offset,
             len: length,
         });
-        offset += length;
     }
 
     Some(entries)
@@ -2292,234 +2223,6 @@ fn render_torrent_file_progress_dropdown(ui: &mut egui::Ui, cache_dir: &std::pat
                 });
             }
         });
-}
-
-fn read_torrent_range(files: &[TorrentFileEntry], start: u64, len: u64) -> Option<Vec<u8>> {
-    let end = start.checked_add(len)?;
-    let mut out = Vec::with_capacity(len as usize);
-
-    for entry in files {
-        let file_start = entry.start;
-        let file_end = entry.start.checked_add(entry.len)?;
-        let overlap_start = start.max(file_start);
-        let overlap_end = end.min(file_end);
-        if overlap_start >= overlap_end {
-            continue;
-        }
-
-        let mut file = fs::File::open(&entry.path).ok()?;
-        file.seek(SeekFrom::Start(overlap_start - file_start))
-            .ok()?;
-        let overlap_len = (overlap_end - overlap_start) as usize;
-        let mut buf = vec![0; overlap_len];
-        file.read_exact(&mut buf).ok()?;
-        out.extend_from_slice(&buf);
-    }
-
-    if out.len() == len as usize {
-        Some(out)
-    } else {
-        None
-    }
-}
-
-fn file_len_and_mtime_ns(path: &std::path::Path) -> Option<(u64, u64)> {
-    let metadata = path.metadata().ok()?;
-    let modified = metadata.modified().ok()?;
-    let mtime_ns = modified.duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64;
-    Some((metadata.len(), mtime_ns))
-}
-
-fn write_verified_torrent_ranges_progress(
-    cache_dir: &std::path::Path,
-    media_path: &std::path::Path,
-) {
-    write_verified_torrent_progress_with_mode(cache_dir, media_path, false);
-}
-
-fn write_verified_torrent_progress_with_mode(
-    cache_dir: &std::path::Path,
-    media_path: &std::path::Path,
-    include_playable_probe: bool,
-) {
-    let torrent_path = cache_dir.join("movie.torrent");
-    let (media_size, media_mtime_ns) = match file_len_and_mtime_ns(media_path) {
-        Some(stamp) => stamp,
-        None => return,
-    };
-    let (torrent_size, torrent_mtime_ns) = match file_len_and_mtime_ns(&torrent_path) {
-        Some(stamp) => stamp,
-        None => return,
-    };
-    let torrent_bytes = match fs::read(torrent_path) {
-        Ok(bytes) => bytes,
-        Err(_) => return,
-    };
-
-    let root = match parse_bencode(&torrent_bytes).and_then(|value| match value {
-        BValue::Dict(dict) => Some(dict),
-        _ => None,
-    }) {
-        Some(root) => root,
-        None => return,
-    };
-    let info = match bdict_get(&root, b"info").and_then(bvalue_dict) {
-        Some(info) => info,
-        None => return,
-    };
-    let piece_len = match bdict_get(info, b"piece length").and_then(bvalue_int) {
-        Some(piece_len) if piece_len > 0 => piece_len,
-        _ => return,
-    };
-    let pieces = match bdict_get(info, b"pieces").and_then(bvalue_bytes) {
-        Some(pieces) if pieces.len() % 20 == 0 => pieces,
-        _ => return,
-    };
-    let files = match torrent_files_from_info(cache_dir, info) {
-        Some(files) => files,
-        None => return,
-    };
-    let total_torrent_len: u64 = files.iter().map(|file| file.len).sum();
-
-    let media_abs = media_path
-        .canonicalize()
-        .unwrap_or_else(|_| media_path.to_path_buf());
-    let target = match files.iter().find(|file| {
-        file.path
-            .canonicalize()
-            .unwrap_or_else(|_| file.path.clone())
-            == media_abs
-    }) {
-        Some(target) => target,
-        None => return,
-    };
-
-    let mut verified_bytes = 0;
-    let mut verified_ranges: Vec<(u64, u64)> = Vec::new();
-    let target_start = target.start;
-    let target_end = target.start + target.len;
-
-    for (idx, expected) in pieces.chunks(20).enumerate() {
-        let piece_start = idx as u64 * piece_len;
-        let piece_end = (piece_start + piece_len).min(total_torrent_len);
-        let overlap_start = piece_start.max(target_start);
-        let overlap_end = piece_end.min(target_end);
-        if overlap_start >= overlap_end {
-            continue;
-        }
-
-        let piece_size = piece_end - piece_start;
-        if let Some(piece_data) = read_torrent_range(&files, piece_start, piece_size) {
-            let digest = Sha1::digest(&piece_data);
-            if digest.as_slice() == expected {
-                let rel_start = overlap_start - target_start;
-                let rel_end = overlap_end - target_start;
-                verified_ranges.push((rel_start, rel_end));
-                verified_bytes += rel_end - rel_start;
-            }
-        }
-    }
-
-    verified_ranges.sort_by_key(|range| range.0);
-    let mut merged_ranges: Vec<(u64, u64)> = Vec::new();
-    for (start, end) in verified_ranges {
-        if let Some(last) = merged_ranges.last_mut() {
-            if start <= last.1 {
-                last.1 = last.1.max(end);
-                continue;
-            }
-        }
-        merged_ranges.push((start, end));
-    }
-
-    let contiguous_prefix_end = merged_ranges
-        .first()
-        .and_then(|(start, end)| if *start == 0 { Some(*end) } else { None })
-        .unwrap_or(0);
-
-    let ranges_json: Vec<_> = merged_ranges
-        .iter()
-        .map(|(start, end)| serde_json::json!([start, end]))
-        .collect();
-
-    let mut progress_json = serde_json::json!({
-        "verifier_version": PROGRESS_VERIFIER_VERSION,
-        "media_size_bytes": media_size,
-        "media_mtime_ns": media_mtime_ns,
-        "torrent_size_bytes": torrent_size,
-        "torrent_mtime_ns": torrent_mtime_ns,
-        "downloaded_bytes": verified_bytes,
-        "total_bytes": target.len,
-        "contiguous_prefix_bytes": contiguous_prefix_end,
-        "ranges": ranges_json,
-    });
-    if include_playable_probe {
-        progress_json["playable_prefix_ratio"] =
-            serde_json::json!(probe_mpv_playable_prefix(media_path));
-    }
-    if let Ok(content) = serde_json::to_string(&progress_json) {
-        let _ = fs::write(progress_file_path(cache_dir), content);
-    }
-}
-
-fn spawn_gap_aware_progress_scanner(dest_dir: PathBuf, dir_name: String, torrent_status: Arc<Mutex<TorrentStatusMap>>) {
-    thread::spawn(move || {
-        let mut last_media_stamp = None;
-
-        loop {
-            let active = torrent_status
-                .lock()
-                .map(|map| map.get(&dir_name).map(|s| s.active).unwrap_or(false))
-                .unwrap_or(false);
-            if !active {
-                break;
-            }
-
-            if let Some(media_path) = find_media_file(&dest_dir) {
-                let media_stamp = file_len_and_mtime_ns(&media_path);
-                if media_stamp.is_some() && media_stamp != last_media_stamp {
-                    write_verified_torrent_ranges_progress(&dest_dir, &media_path);
-                    last_media_stamp = media_stamp;
-                }
-            }
-
-            thread::sleep(Duration::from_secs(2));
-        }
-    });
-}
-
-fn mpv_can_start_at_ratio(media_path: &std::path::Path, ratio: f64) -> bool {
-    let start = format!("--start={:.3}%", ratio * 100.0);
-    Command::new("mpv")
-        .args([
-            "--no-config",
-            "--really-quiet",
-            "--vo=null",
-            "--ao=null",
-            "--frames=120",
-            "--no-resume-playback",
-            &start,
-            media_path.to_str().unwrap_or_default(),
-        ])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn probe_mpv_playable_prefix(media_path: &std::path::Path) -> f64 {
-    let mut low = 0.0;
-    let mut high = 1.0;
-
-    for _ in 0..8 {
-        let mid = (low + high) / 2.0;
-        if mpv_can_start_at_ratio(media_path, mid) {
-            low = mid;
-        } else {
-            high = mid;
-        }
-    }
-
-    (low * 0.95).clamp(0.0, 1.0)
 }
 
 fn mpv_script_path() -> Option<String> {
@@ -6671,17 +6374,12 @@ impl PanelRenderHelper for AppState {
                                             );
                                             ctx_clone.request_repaint();
 
-		                                        spawn_gap_aware_progress_scanner(
-		                                            dest_dir.clone(),
-		                                            dir_to_play.clone(),
-	                                            torrent_status_clone.clone(),
-	                                        );
-
 		                                        let mut cmd = build_libtorrent_worker_command(
                                                     torrent_source.as_str(),
                                                     dest.as_str(),
                                                     "Movie",
                                                     sequential_mode,
+                                                    sequential_mode.then_some(20),
                                                 );
 
 			                                        match cmd.spawn() {
@@ -6741,25 +6439,18 @@ impl PanelRenderHelper for AppState {
                                     .fill(egui::Color32::from_rgb(0, 120, 200)),
                                 );
                                 if play_local_btn.clicked() {
-                                    match local_playback_guard(&parent_cache_path, &media_path) {
-                                        Ok(()) => {
-                                            let path_str = media_path.to_str().unwrap_or_default().to_string();
-                                            let progress_file = progress_file_path(&parent_cache_path);
-                                            let children_clone = self.spawned_children.clone();
-                                            thread::spawn(move || {
-                                                let mut cmd = Command::new("mpv");
-                                                cmd.args(direct_mpv_args(&progress_file));
-                                                cmd.arg(&path_str);
-                                                if let Ok(child) = cmd.spawn() {
-                                                    children_clone.lock().unwrap().push(child);
-                                                }
-                                            });
-                                            self.status_message = "Opened verified local file in mpv.".to_string();
+                                    let path_str = media_path.to_str().unwrap_or_default().to_string();
+                                    let progress_file = progress_file_path(&parent_cache_path);
+                                    let children_clone = self.spawned_children.clone();
+                                    thread::spawn(move || {
+                                        let mut cmd = Command::new("mpv");
+                                        cmd.args(direct_mpv_args(&progress_file));
+                                        cmd.arg(&path_str);
+                                        if let Ok(child) = cmd.spawn() {
+                                            children_clone.lock().unwrap().push(child);
                                         }
-                                        Err(reason) => {
-                                            self.status_message = reason;
-                                        }
-                                    }
+                                    });
+                                    self.status_message = "Opened local file in mpv.".to_string();
                                 }
 
                                 let delete_file_btn = ui.add_sized(
@@ -7196,17 +6887,12 @@ impl PanelRenderHelper for AppState {
                                                 );
                                                 ctx_clone.request_repaint();
 
-                                                spawn_gap_aware_progress_scanner(
-                                                    dest_dir.clone(),
-                                                    hash_clone.clone(),
-                                                    torrent_status_clone.clone(),
-                                                );
-
                                                 let mut cmd = build_libtorrent_worker_command(
                                                     torrent_source.as_str(),
                                                     dest.as_str(),
                                                     title_for_launch.as_str(),
                                                     sequential_mode,
+                                                    sequential_mode.then_some(20),
                                                 );
 
 			                                                match cmd.spawn() {
@@ -7274,36 +6960,29 @@ impl PanelRenderHelper for AppState {
                                         );
                                         if play_local_btn.clicked() {
                                             if let Some(ref media_path) = local_media {
-                                                match local_playback_guard(&local_cache_path, media_path) {
-                                                    Ok(()) => {
-                                                        let path_str = media_path
-                                                            .to_str()
-                                                            .unwrap_or_default()
-                                                            .to_string();
-                                                        let progress_file =
-                                                            progress_file_path(&local_cache_path);
-                                                        let children_clone =
-                                                            self.spawned_children.clone();
-                                                        thread::spawn(move || {
-                                                            let mut cmd = Command::new("mpv");
-                                                            cmd.args(direct_mpv_args(&progress_file));
-                                                            cmd.arg(&path_str);
-                                                            if let Ok(child) = cmd.spawn() {
-                                                                children_clone
-                                                                    .lock()
-                                                                    .unwrap()
-                                                                    .push(child);
-                                                            }
-                                                        });
-                                                        self.status_message = format!(
-                                                            "Opened verified {} local file in mpv.",
-                                                            opt.quality
-                                                        );
+                                                let path_str = media_path
+                                                    .to_str()
+                                                    .unwrap_or_default()
+                                                    .to_string();
+                                                let progress_file =
+                                                    progress_file_path(&local_cache_path);
+                                                let children_clone =
+                                                    self.spawned_children.clone();
+                                                thread::spawn(move || {
+                                                    let mut cmd = Command::new("mpv");
+                                                    cmd.args(direct_mpv_args(&progress_file));
+                                                    cmd.arg(&path_str);
+                                                    if let Ok(child) = cmd.spawn() {
+                                                        children_clone
+                                                            .lock()
+                                                            .unwrap()
+                                                            .push(child);
                                                     }
-                                                    Err(reason) => {
-                                                        self.status_message = reason;
-                                                    }
-                                                }
+                                                });
+                                                self.status_message = format!(
+                                                    "Opened {} local file in mpv.",
+                                                    opt.quality
+                                                );
                                             }
                                         }
 
