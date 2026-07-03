@@ -522,6 +522,7 @@ fn find_media_file(dir: &std::path::Path) -> Option<PathBuf> {
 fn find_media_file_excluding(dir: &std::path::Path, excluded_direct_children: &[String]) -> Option<PathBuf> {
     let mut largest_file = None;
     let mut max_size = 0;
+    let mut best_progress_score = 0;
 
     fn visit_dirs(
         root: &std::path::Path,
@@ -529,6 +530,7 @@ fn find_media_file_excluding(dir: &std::path::Path, excluded_direct_children: &[
         excluded_direct_children: &[String],
         largest: &mut Option<PathBuf>,
         max_sz: &mut u64,
+        best_progress_score: &mut u64,
     ) {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -537,7 +539,14 @@ fn find_media_file_excluding(dir: &std::path::Path, excluded_direct_children: &[
                     continue;
                 }
                 if path.is_dir() {
-                    visit_dirs(root, &path, excluded_direct_children, largest, max_sz);
+                    visit_dirs(
+                        root,
+                        &path,
+                        excluded_direct_children,
+                        largest,
+                        max_sz,
+                        best_progress_score,
+                    );
                 } else if path.is_file() {
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         let ext_lower = ext.to_lowercase();
@@ -545,8 +554,14 @@ fn find_media_file_excluding(dir: &std::path::Path, excluded_direct_children: &[
                             .contains(&ext_lower.as_str())
                         {
                             if let Ok(meta) = path.metadata() {
-                                if meta.len() > *max_sz {
-                                    *max_sz = meta.len();
+                                let media_size = meta.len();
+                                let progress_score = media_progress_score(root, &path);
+                                if media_size > *max_sz
+                                    || (media_size == *max_sz
+                                        && progress_score > *best_progress_score)
+                                {
+                                    *max_sz = media_size;
+                                    *best_progress_score = progress_score;
                                     *largest = Some(path.clone());
                                 }
                             }
@@ -557,8 +572,35 @@ fn find_media_file_excluding(dir: &std::path::Path, excluded_direct_children: &[
         }
     }
 
-    visit_dirs(dir, dir, excluded_direct_children, &mut largest_file, &mut max_size);
+    visit_dirs(
+        dir,
+        dir,
+        excluded_direct_children,
+        &mut largest_file,
+        &mut max_size,
+        &mut best_progress_score,
+    );
     largest_file
+}
+
+fn media_progress_score(root: &std::path::Path, media_path: &std::path::Path) -> u64 {
+    let mut current = media_path.parent();
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    while let Some(dir) = current {
+        let progress_path = progress_file_path(dir);
+        if progress_path.exists() {
+            let score = progress_file_quality_score(&progress_path);
+            if score > 0 {
+                return score;
+            }
+        }
+        let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if canonical_dir == root {
+            break;
+        }
+        current = dir.parent();
+    }
+    0
 }
 
 fn is_under_excluded_direct_child(
@@ -2292,6 +2334,118 @@ fn progress_file_path(dest_dir: &std::path::Path) -> PathBuf {
     }
 }
 
+fn progress_file_quality_score(progress_file: &std::path::Path) -> u64 {
+    fs::read_to_string(progress_file)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .map(|json| {
+            let contiguous = json
+                .get("contiguous_prefix_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let downloaded = json
+                .get("downloaded_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let ranges_bonus = json
+                .get("ranges")
+                .and_then(|v| v.as_array())
+                .map(|ranges| if ranges.is_empty() { 0 } else { 1 })
+                .unwrap_or(0);
+            contiguous
+                .saturating_mul(4)
+                .saturating_add(downloaded)
+                .saturating_add(ranges_bonus)
+        })
+        .unwrap_or(0)
+}
+
+fn dir_contains_matching_media_file(
+    dir: &std::path::Path,
+    target_name: &std::ffi::OsStr,
+    target_size: u64,
+) -> bool {
+    fn visit(dir: &std::path::Path, target_name: &std::ffi::OsStr, target_size: u64) -> bool {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if visit(&path, target_name, target_size) {
+                    return true;
+                }
+                continue;
+            }
+            if !path.is_file() || path.file_name() != Some(target_name) {
+                continue;
+            }
+            if path.metadata().map(|meta| meta.len()).ok() == Some(target_size) {
+                return true;
+            }
+        }
+        false
+    }
+
+    visit(dir, target_name, target_size)
+}
+
+fn resolve_playback_progress_file(
+    cache_dir: &std::path::Path,
+    media_path: &std::path::Path,
+) -> PathBuf {
+    let direct_progress = progress_file_path(cache_dir);
+    let media_parent_progress = media_path
+        .parent()
+        .map(progress_file_path)
+        .filter(|path| path.exists());
+    if let Some(path) = media_parent_progress {
+        return path;
+    }
+
+    let target_name = match media_path.file_name() {
+        Some(name) => name,
+        None => return direct_progress,
+    };
+    let target_size = match fs::metadata(media_path) {
+        Ok(meta) => meta.len(),
+        Err(_) => return direct_progress,
+    };
+
+    let mut best_path = if direct_progress.exists() {
+        Some(direct_progress.clone())
+    } else {
+        None
+    };
+    let mut best_score = best_path
+        .as_ref()
+        .map(|path| progress_file_quality_score(path))
+        .unwrap_or(0);
+
+    if let Ok(entries) = fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            let child_path = entry.path();
+            if !child_path.is_dir() {
+                continue;
+            }
+            let child_progress = progress_file_path(&child_path);
+            if !child_progress.exists() {
+                continue;
+            }
+            if !dir_contains_matching_media_file(&child_path, target_name, target_size) {
+                continue;
+            }
+            let child_score = progress_file_quality_score(&child_progress);
+            if child_score > best_score {
+                best_score = child_score;
+                best_path = Some(child_progress);
+            }
+        }
+    }
+
+    best_path.unwrap_or(direct_progress)
+}
+
 fn python_tool_command(script_relative_path: &str) -> Command {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let venv_python = cwd.join(".venv").join("bin").join("python");
@@ -2369,9 +2523,10 @@ fn direct_mpv_args(progress_file: &std::path::Path) -> Vec<String> {
     let mut args = vec![
         "--load-scripts=no".to_string(),
         "--osc=no".to_string(),
+        "--ytdl=no".to_string(),
         "--no-resume-playback".to_string(),
         format!(
-            "--script-opts=osc-layout=bottombar,osc-seekbarstyle=bar,osc-torrent_progress_file={}",
+            "--script-opts=osc-layout=bottombar,osc-seekbarstyle=bar,osc-seekrangestyle=none,osc-torrent_progress_file={}",
             progress_file.to_string_lossy()
         ),
     ];
@@ -2383,6 +2538,16 @@ fn direct_mpv_args(progress_file: &std::path::Path) -> Vec<String> {
     args.push("--slang=en,eng,english".to_string());
 
     args
+}
+
+fn proxy_stream_url(proxy_port: u16, media_path: &std::path::Path) -> String {
+    let route = media_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| format!("contiguous-stream.{}", ext.to_ascii_lowercase()))
+        .unwrap_or_else(|| "contiguous-stream".to_string());
+    format!("http://127.0.0.1:{}/{}", proxy_port, route)
 }
 
 fn launch_mpv(
@@ -2416,11 +2581,21 @@ fn launch_mpv(
 
     let mut cmd = Command::new("mpv");
     cmd.args(direct_mpv_args(progress_file));
-    cmd.arg(format!("http://127.0.0.1:{}/stream", proxy_port));
+    cmd.arg(proxy_stream_url(proxy_port, media_path));
     match cmd.spawn() {
-        Ok(child) => {
-            spawned_children.lock().unwrap().push(child);
-            Ok(())
+        Ok(mut child) => {
+            thread::sleep(Duration::from_millis(500));
+            match child.try_wait() {
+                Ok(Some(status)) => Err(format!(
+                    "mpv exited immediately with status {}",
+                    status
+                )),
+                Ok(None) => {
+                    spawned_children.lock().unwrap().push(child);
+                    Ok(())
+                }
+                Err(err) => Err(format!("failed to poll mpv startup: {}", err)),
+            }
         }
         Err(err) => Err(err.to_string()),
     }
@@ -6244,6 +6419,12 @@ impl PanelRenderHelper for AppState {
                             .unwrap_or_else(|| "Default Stream".to_string());
 
                         ui.label(egui::RichText::new(label).strong());
+                        if let Some(runtime) = movie_runtime_label(torrent.metadata.as_ref()) {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Runtime:").strong());
+                                ui.label(runtime);
+                            });
+                        }
                         ui.add_space(4.0);
 
 	                        if let Some(ref hash) = root_hash {
@@ -6421,12 +6602,6 @@ impl PanelRenderHelper for AppState {
                                 ui.label(egui::RichText::new("Largest Media File:").strong());
                                 ui.label(path.file_name().unwrap_or_default().to_string_lossy());
                             });
-                            if let Some(runtime) = movie_runtime_label(torrent.metadata.as_ref()) {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("Runtime:").strong());
-                                    ui.label(runtime);
-                                });
-                            }
                             render_torrent_file_progress_dropdown(ui, &parent_cache_path);
                         }
 
@@ -6593,7 +6768,8 @@ impl PanelRenderHelper for AppState {
                                     .fill(egui::Color32::from_rgb(0, 120, 200)),
                                 );
                                 if play_local_btn.clicked() {
-                                    let progress_file = progress_file_path(&parent_cache_path);
+                                    let progress_file =
+                                        resolve_playback_progress_file(&parent_cache_path, &media_path);
                                     match launch_mpv(
                                         &self.spawned_children,
                                         &media_path,
@@ -6736,6 +6912,12 @@ impl PanelRenderHelper for AppState {
                                 ui.label(
                                     egui::RichText::new(format!("Stream Option: {}", opt.quality)).strong(),
                                 );
+                                if let Some(runtime) = movie_runtime_label(torrent.metadata.as_ref()) {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Runtime:").strong());
+                                        ui.label(runtime);
+                                    });
+                                }
                                 ui.add_space(4.0);
 
                                 ui.horizontal(|ui| {
@@ -6939,14 +7121,6 @@ impl PanelRenderHelper for AppState {
                                             ui.label(egui::RichText::new("Largest Media File:").strong());
                                             ui.label(path.file_name().unwrap_or_default().to_string_lossy());
                                         });
-                                        if let Some(runtime) =
-                                            movie_runtime_label(torrent.metadata.as_ref())
-                                        {
-                                            ui.horizontal(|ui| {
-                                                ui.label(egui::RichText::new("Runtime:").strong());
-                                                ui.label(runtime);
-                                            });
-                                        }
                                         render_torrent_file_progress_dropdown(ui, &local_cache_path);
                                     }
                                 }
@@ -7119,8 +7293,10 @@ impl PanelRenderHelper for AppState {
                                         );
                                         if play_local_btn.clicked() {
                                             if let Some(ref media_path) = local_media {
-                                                let progress_file =
-                                                    progress_file_path(&local_cache_path);
+                                                let progress_file = resolve_playback_progress_file(
+                                                    &local_cache_path,
+                                                    media_path,
+                                                );
                                                 match launch_mpv(
                                                     &self.spawned_children,
                                                     media_path,

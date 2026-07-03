@@ -34,3 +34,6 @@ recover_old_steps.py
 extract_json_args.py
 extract_step_details.py
 step_*_edit.json
+
+# Local helper scripts
+tools/transmission-finish.sh

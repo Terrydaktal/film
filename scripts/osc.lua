@@ -488,30 +488,8 @@ local function torrent_progress_ranges()
         local capped_ranges = {}
         local is_complete = downloaded >= total
         local range_cap = 1
-        local safe_contiguous_prefix = contiguous_prefix
-        if not is_complete and safe_contiguous_prefix then
-            safe_contiguous_prefix = math.max(
-                0,
-                safe_contiguous_prefix - torrent_safe_prefix_guard_bytes
-            )
-        end
         if not is_complete and playable_prefix then
             range_cap = limit_range(0, 1, playable_prefix)
-        end
-        if not is_complete and safe_contiguous_prefix and safe_contiguous_prefix > 0 then
-            local range_end = math.min(
-                limit_range(0, 1, safe_contiguous_prefix / total),
-                range_cap
-            ) * 100
-            if range_end > 0 then
-                capped_ranges[#capped_ranges + 1] = {
-                    start = 0,
-                    ["end"] = range_end,
-                    byte_start = 0,
-                    byte_end = safe_contiguous_prefix,
-                }
-            end
-            return capped_ranges, total
         end
         for _, range in ipairs(ranges) do
             local range_start = limit_range(0, 1, range[1] / total) * 100
@@ -544,6 +522,51 @@ local function torrent_progress_ranges()
     end
 
     return nil, nil
+end
+
+local function player_safe_ranges()
+    local path = mp.get_property("path")
+    if (not path or path == "") and user_opts.torrent_progress_file == "" then
+        return nil
+    end
+
+    local progress_path = torrent_progress_file_for(path)
+    if not progress_path then
+        return nil
+    end
+
+    local fh = io.open(progress_path, "r")
+    if not fh then
+        return nil
+    end
+
+    local content = fh:read("*all")
+    fh:close()
+
+    local downloaded = tonumber(content:match('"downloaded_bytes"%s*:%s*(%d+)'))
+    local total = tonumber(content:match('"total_bytes"%s*:%s*(%d+)'))
+    local player_safe_seconds = tonumber(content:match('"player_safe_seconds"%s*:%s*([%d%.]+)'))
+    if not total or total <= 0 or not downloaded or downloaded <= 0 then
+        return nil
+    end
+
+    local is_complete = downloaded >= total
+    if is_complete then
+        return {{start = 0, ["end"] = 100}}
+    end
+    if not player_safe_seconds or player_safe_seconds <= 0 then
+        return nil
+    end
+
+    local duration = mp.get_property_number("duration")
+    if duration == nil or duration <= 0 then
+        return nil
+    end
+
+    return {{
+        start = 0,
+        ["end"] = limit_range(0, 1, player_safe_seconds / duration) * 100,
+    }}
 end
 
 -- translate value into element coordinates
@@ -1125,12 +1148,15 @@ local function render_elements(master_ass)
                     local torrentH = math.min(3, math.max(1, innerH / 3))
                     local torrentY1 = (elem_geo.h / 2) - (torrentH / 2)
                     local torrentY2 = (elem_geo.h / 2) + (torrentH / 2)
+                    local safeH = math.max(1, torrentH - 1)
+                    local safeY1 = (elem_geo.h / 2) - (safeH / 2)
+                    local safeY2 = (elem_geo.h / 2) + (safeH / 2)
                     local prev_draw_end = nil
                     local prev_byte_end = nil
 
                     elem_ass:draw_stop()
                     elem_ass:merge(style_ass)
-                    elem_ass:append("{\\1c&H55CC00&\\1a&H77&}")
+                    elem_ass:append("{\\1c&H206000&\\1a&H66&}")
                     elem_ass:draw_start()
 
                     for _, range in ipairs(torrentRanges) do
@@ -1154,6 +1180,26 @@ local function render_elements(master_ass)
                         prev_byte_end = range.byte_end
                     end
                     elem_ass:draw_stop()
+
+                    local safeRanges = player_safe_ranges()
+                    if safeRanges then
+                        elem_ass:merge(style_ass)
+                        elem_ass:append("{\\1c&H55FF55&\\1a&H33&}")
+                        elem_ass:draw_start()
+                        for _, range in ipairs(safeRanges) do
+                            local pstart = get_slider_ele_pos_for(element, range["start"])
+                            local pend = get_slider_ele_pos_for(element, range["end"])
+                            if pend > pstart then
+                                if slider_lo.stype == "bar" then
+                                    elem_ass:rect_cw(pstart, safeY1, pend, safeY2)
+                                else
+                                    ass_draw_rr_h_cw(elem_ass, pstart, foH - 1, pend, foH + 1, 1,
+                                                     slider_lo.stype == "diamond")
+                                end
+                            end
+                        end
+                        elem_ass:draw_stop()
+                    end
                 end
             end
 

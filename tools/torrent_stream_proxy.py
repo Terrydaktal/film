@@ -4,17 +4,20 @@ import argparse
 import json
 import mimetypes
 import os
-import socketserver
+import shutil
+import subprocess
 import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote
 
 
 POLL_INTERVAL_SECONDS = 0.25
 READ_CHUNK_BYTES = 512 * 1024
 URGENT_MARGIN_BYTES = 8 * 1024 * 1024
+HLS_SEGMENT_SECONDS = 4
 
 
 def load_progress(progress_path: Path) -> dict:
@@ -58,6 +61,16 @@ def available_end_for_offset(progress_path: Path, total_bytes: int, offset: int)
     return offset
 
 
+def contiguous_prefix_end(progress_path: Path, total_bytes: int) -> int:
+    progress = load_progress(progress_path)
+    for start, end in normalized_ranges(progress, total_bytes):
+        if start == 0:
+            return end
+        if start > 0:
+            break
+    return 0
+
+
 def parse_range_header(range_header: str | None, total_bytes: int) -> tuple[int, int, bool]:
     if not range_header:
         return 0, total_bytes - 1, False
@@ -89,9 +102,249 @@ class TorrentStreamProxyServer(ThreadingHTTPServer):
         self.media_path = media_path
         self.progress_path = progress_path
         self.stream_state_path = progress_path.parent / ".stream_state.json"
+        self.hls_dir = progress_path.parent / ".hls_stream"
+        self.playlist_path = self.hls_dir / "playlist.m3u8"
+        self.segment_pattern = self.hls_dir / "segment_%05d.ts"
+        self.ffmpeg_log_path = self.hls_dir / "ffmpeg.log"
+        self.ffmpeg_proc: subprocess.Popen | None = None
+        self.player_safe_probe_proc: subprocess.Popen | None = None
+        self.progress_lock = threading.Lock()
         self.total_bytes = max(0, media_path.stat().st_size)
         guessed_type, _ = mimetypes.guess_type(media_path.name)
         self.content_type = guessed_type or "application/octet-stream"
+
+    def prepare_hls_dir(self):
+        if self.hls_dir.exists():
+            shutil.rmtree(self.hls_dir, ignore_errors=True)
+        self.hls_dir.mkdir(parents=True, exist_ok=True)
+
+    def ffmpeg_running(self) -> bool:
+        return self.ffmpeg_proc is not None and self.ffmpeg_proc.poll() is None
+
+    def wait_for_file(self, path: Path, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else (time.time() + timeout)
+        while True:
+            if path.exists() and path.stat().st_size > 0:
+                return True
+            if self.ffmpeg_proc is not None and self.ffmpeg_proc.poll() is not None:
+                return path.exists() and path.stat().st_size > 0
+            if deadline is not None and time.time() >= deadline:
+                return path.exists() and path.stat().st_size > 0
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+    def start_ffmpeg_hls(self):
+        def launcher():
+            time.sleep(0.25)
+            self.prepare_hls_dir()
+            raw_stream_url = self.contiguous_stream_url()
+            base_args = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-fflags",
+                "+genpts+discardcorrupt",
+                "-err_detect",
+                "ignore_err",
+                "-seekable",
+                "0",
+                "-i",
+                raw_stream_url,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-sn",
+                "-f",
+                "hls",
+                "-hls_time",
+                str(HLS_SEGMENT_SECONDS),
+                "-hls_list_size",
+                "0",
+                "-hls_playlist_type",
+                "event",
+                "-start_number",
+                "0",
+                "-hls_segment_filename",
+                str(self.segment_pattern),
+                "-hls_flags",
+                "append_list+independent_segments+temp_file",
+            ]
+            copy_args = base_args + [
+                "-c",
+                "copy",
+                str(self.playlist_path),
+            ]
+            transcode_args = base_args + [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-tune",
+                "zerolatency",
+                "-g",
+                "48",
+                "-sc_threshold",
+                "0",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "160k",
+                str(self.playlist_path),
+            ]
+            log_file = self.ffmpeg_log_path.open("ab")
+            proc = subprocess.Popen(
+                copy_args,
+                stdout=log_file,
+                stderr=log_file,
+            )
+            self.ffmpeg_proc = proc
+            time.sleep(1.0)
+            if proc.poll() is None:
+                return
+            proc = subprocess.Popen(
+                transcode_args,
+                stdout=log_file,
+                stderr=log_file,
+            )
+            self.ffmpeg_proc = proc
+
+        threading.Thread(target=launcher, daemon=True).start()
+
+    def stop_ffmpeg(self):
+        if self.ffmpeg_proc is None:
+            return
+        if self.ffmpeg_proc.poll() is None:
+            try:
+                self.ffmpeg_proc.terminate()
+                self.ffmpeg_proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self.ffmpeg_proc.kill()
+                except Exception:
+                    pass
+        self.ffmpeg_proc = None
+
+    def contiguous_stream_url(self) -> str:
+        media_ext = self.media_path.suffix.lower()
+        contiguous_route = (
+            f"/contiguous-stream{media_ext}" if media_ext else "/contiguous-stream"
+        )
+        return f"http://127.0.0.1:{self.server_address[1]}{contiguous_route}"
+
+    def update_progress_fields(self, fields: dict):
+        with self.progress_lock:
+            progress = load_progress(self.progress_path)
+            if "player_safe_seconds" in fields:
+                existing = progress.get("player_safe_seconds")
+                if isinstance(existing, (int, float)):
+                    fields["player_safe_seconds"] = max(
+                        float(existing),
+                        float(fields["player_safe_seconds"]),
+                    )
+            progress.update(fields)
+            tmp_path = self.progress_path.with_suffix(self.progress_path.suffix + ".tmp")
+            try:
+                tmp_path.write_text(json.dumps(progress, ensure_ascii=True))
+                tmp_path.replace(self.progress_path)
+            except Exception:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def start_player_safe_probe(self):
+        def launcher():
+            time.sleep(0.5)
+            stream_url = self.contiguous_stream_url()
+            probe_log_path = self.progress_path.parent / ".player_safe_probe.log"
+            cached_progress = load_progress(self.progress_path)
+            cached_safe_seconds = cached_progress.get("player_safe_seconds")
+            resume_seconds = (
+                max(0.0, float(cached_safe_seconds) - 5.0)
+                if isinstance(cached_safe_seconds, (int, float))
+                else 0.0
+            )
+            args = [
+                "ffmpeg",
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "error",
+            ]
+            if resume_seconds > 0:
+                args.extend(["-ss", f"{resume_seconds:.3f}"])
+            args.extend([
+                "-i",
+                stream_url,
+                "-map",
+                "0:v:0",
+                "-an",
+                "-sn",
+                "-f",
+                "null",
+                "-",
+                "-progress",
+                "pipe:1",
+            ])
+            log_file = probe_log_path.open("ab")
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=log_file,
+                text=True,
+                bufsize=1,
+            )
+            self.player_safe_probe_proc = proc
+            last_written_seconds = -1.0
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
+                key, _, value = line.strip().partition("=")
+                if key == "out_time_ms":
+                    try:
+                        seconds = resume_seconds + max(0.0, int(value) / 1_000_000.0)
+                    except ValueError:
+                        continue
+                elif key == "out_time":
+                    parts = value.split(":")
+                    if len(parts) != 3:
+                        continue
+                    try:
+                        seconds = resume_seconds + (
+                            int(parts[0]) * 3600
+                            + int(parts[1]) * 60
+                            + float(parts[2])
+                        )
+                    except ValueError:
+                        continue
+                else:
+                    continue
+                if seconds >= last_written_seconds + 1.0:
+                    self.update_progress_fields(
+                        {
+                            "player_safe_seconds": seconds,
+                            "player_safe_source": "ffmpeg_decode_probe",
+                            "player_safe_updated_at": time.time(),
+                        }
+                    )
+                    last_written_seconds = seconds
+
+        threading.Thread(target=launcher, daemon=True).start()
+
+    def stop_player_safe_probe(self):
+        if self.player_safe_probe_proc is None:
+            return
+        if self.player_safe_probe_proc.poll() is None:
+            try:
+                self.player_safe_probe_proc.terminate()
+                self.player_safe_probe_proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self.player_safe_probe_proc.kill()
+                except Exception:
+                    pass
+        self.player_safe_probe_proc = None
 
 
 class TorrentStreamHandler(BaseHTTPRequestHandler):
@@ -132,23 +385,61 @@ class TorrentStreamHandler(BaseHTTPRequestHandler):
             if send_body:
                 self.wfile.write(b"ok")
             return
-        if self.path.split("?", 1)[0] != "/stream":
+        route = self.path.split("?", 1)[0]
+        is_contiguous_stream = route == "/contiguous-stream" or route.startswith("/contiguous-stream.")
+        if route == "/playlist.m3u8":
+            if not self.server.wait_for_file(self.server.playlist_path, timeout=30):
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "playlist not ready")
+                return
+            self._serve_file(self.server.playlist_path, "application/vnd.apple.mpegurl", send_body)
+            return
+        if (
+            route.startswith("/segments/")
+            or route.endswith(".ts")
+            or route.endswith(".m4s")
+            or (route.endswith(".mp4") and not is_contiguous_stream)
+        ):
+            segment_name = (
+                Path(unquote(route.removeprefix("/segments/"))).name
+                if route.startswith("/segments/")
+                else Path(unquote(route.lstrip("/"))).name
+            )
+            segment_path = self.server.hls_dir / segment_name
+            if not self.server.wait_for_file(segment_path, timeout=None):
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "segment not ready")
+                return
+            self._serve_file(segment_path, "video/mp2t", send_body)
+            return
+        if route != "/stream" and not is_contiguous_stream:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         total_bytes = self.server.total_bytes
         if total_bytes <= 0:
             self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "media file is empty")
             return
-        try:
-            start, end, is_partial = parse_range_header(
-                self.headers.get("Range"),
-                total_bytes,
-            )
-        except ValueError:
-            self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-            self.send_header("Content-Range", f"bytes */{total_bytes}")
-            self.end_headers()
-            return
+        if is_contiguous_stream:
+            range_header = self.headers.get("Range")
+            if range_header:
+                try:
+                    start, end, is_partial = parse_range_header(range_header, total_bytes)
+                except ValueError:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self.send_header("Content-Range", f"bytes */{total_bytes}")
+                    self.end_headers()
+                    return
+            else:
+                start, end, is_partial = 0, total_bytes - 1, False
+        else:
+            try:
+                start, end, is_partial = parse_range_header(
+                    self.headers.get("Range"),
+                    total_bytes,
+                )
+            except ValueError:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{total_bytes}")
+                self.end_headers()
+                return
 
         content_length = (end - start) + 1
         status = HTTPStatus.PARTIAL_CONTENT if is_partial else HTTPStatus.OK
@@ -166,11 +457,17 @@ class TorrentStreamHandler(BaseHTTPRequestHandler):
         position = start
         with self.server.media_path.open("rb") as media_file:
             while position <= end:
-                available_end = available_end_for_offset(
-                    self.server.progress_path,
-                    total_bytes,
-                    position,
-                )
+                if is_contiguous_stream:
+                    available_end = contiguous_prefix_end(
+                        self.server.progress_path,
+                        total_bytes,
+                    )
+                else:
+                    available_end = available_end_for_offset(
+                        self.server.progress_path,
+                        total_bytes,
+                        position,
+                    )
                 self.write_stream_state(position, available_end)
                 if available_end <= position:
                     time.sleep(POLL_INTERVAL_SECONDS)
@@ -187,6 +484,25 @@ class TorrentStreamHandler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     return
                 position += len(payload)
+
+    def _serve_file(self, path: Path, content_type: str, send_body: bool):
+        file_size = path.stat().st_size
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(file_size))
+        self.end_headers()
+        if not send_body:
+            return
+        with path.open("rb") as fh:
+            while True:
+                chunk = fh.read(READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
 
 
 def main():
@@ -208,8 +524,11 @@ def main():
         progress_path=progress_path,
     )
     try:
+        server.start_player_safe_probe()
         server.serve_forever(poll_interval=0.25)
     finally:
+        server.stop_player_safe_probe()
+        server.stop_ffmpeg()
         server.server_close()
 
 
