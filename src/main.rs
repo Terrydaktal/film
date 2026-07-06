@@ -114,8 +114,41 @@ enum BValue {
     Dict(std::collections::BTreeMap<Vec<u8>, BValue>),
 }
 
+fn app_base_dir() -> PathBuf {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    for ancestor in exe_dir.ancestors() {
+        if ancestor.join("Cargo.toml").exists()
+            && ancestor.join("tools").is_dir()
+            && ancestor.join("scripts").is_dir()
+        {
+            return ancestor.to_path_buf();
+        }
+        if ancestor.join("1337x_mirrors.txt").exists()
+            || ancestor.join("yify_mirrors.txt").exists()
+            || ancestor.join("solidtorrents_mirrors.txt").exists()
+        {
+            return ancestor.to_path_buf();
+        }
+    }
+
+    exe_dir
+}
+
+fn app_resource_path(relative: impl AsRef<std::path::Path>) -> PathBuf {
+    app_base_dir().join(relative)
+}
+
 fn get_cache_dir() -> PathBuf {
-    PathBuf::from("./stream_cache")
+    app_resource_path("stream_cache")
+}
+
+fn cache_item_path(dir_name: &str) -> PathBuf {
+    get_cache_dir().join(dir_name)
 }
 
 fn slugify_cache_title(title: &str) -> String {
@@ -746,9 +779,7 @@ fn augment_magnet_trackers(magnet: &str) -> String {
 }
 
 fn libtorrent_worker_path() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("tools/libtorrent_worker.py")
+    app_resource_path("tools/libtorrent_worker.py")
 }
 
 fn build_libtorrent_worker_command(
@@ -759,8 +790,8 @@ fn build_libtorrent_worker_command(
     sequential_start_mib: Option<u32>,
 ) -> Command {
     let worker_path = libtorrent_worker_path();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let venv_python = cwd.join(".venv").join("bin").join("python");
+    let app_base = app_base_dir();
+    let venv_python = app_base.join(".venv").join("bin").join("python");
     let home_uv = std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".local").join("bin").join("uv"));
@@ -782,6 +813,7 @@ fn build_libtorrent_worker_command(
         cmd.arg(worker_path);
         cmd
     };
+    cmd.current_dir(&app_base);
 
     cmd.args([
         "--source",
@@ -2317,9 +2349,7 @@ fn render_torrent_file_progress_dropdown(ui: &mut egui::Ui, cache_dir: &std::pat
 }
 
 fn mpv_script_path() -> Option<String> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("osc.lua");
+    let path = app_resource_path("scripts/osc.lua");
     path.to_str().map(|s| s.to_string())
 }
 
@@ -2327,10 +2357,7 @@ fn progress_file_path(dest_dir: &std::path::Path) -> PathBuf {
     if dest_dir.is_absolute() {
         dest_dir.join(".torrent_progress.json")
     } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(dest_dir)
-            .join(".torrent_progress.json")
+        app_base_dir().join(dest_dir).join(".torrent_progress.json")
     }
 }
 
@@ -2447,27 +2474,27 @@ fn resolve_playback_progress_file(
 }
 
 fn python_tool_command(script_relative_path: &str) -> Command {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let venv_python = cwd.join(".venv").join("bin").join("python");
+    let app_base = app_base_dir();
+    let venv_python = app_base.join(".venv").join("bin").join("python");
     let home_uv = std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".local").join("bin").join("uv"));
 
     if venv_python.exists() {
         let mut cmd = Command::new(venv_python);
-        cmd.arg(cwd.join(script_relative_path));
+        cmd.arg(app_base.join(script_relative_path));
         cmd
     } else if let Some(home_uv) = home_uv.filter(|path| path.exists()) {
         let mut cmd = Command::new(home_uv);
         cmd.env("UV_CACHE_DIR", "/data/.cache/uv");
         cmd.args(["run", "python"]);
-        cmd.arg(cwd.join(script_relative_path));
+        cmd.arg(app_base.join(script_relative_path));
         cmd
     } else {
         let mut cmd = Command::new("uv");
         cmd.env("UV_CACHE_DIR", "/data/.cache/uv");
         cmd.args(["run", "python"]);
-        cmd.arg(cwd.join(script_relative_path));
+        cmd.arg(app_base.join(script_relative_path));
         cmd
     }
 }
@@ -2765,14 +2792,14 @@ fn push_unique_mirror(mirrors: &mut Vec<String>, line: &str) {
 fn load_search_mirrors(source: SearchSource) -> Vec<String> {
     let mut mirrors = Vec::new();
     if let Some(path) = source.api_mirror_file() {
-        if let Ok(content) = fs::read_to_string(path) {
+        if let Ok(content) = fs::read_to_string(app_resource_path(path)) {
             for line in content.lines() {
                 push_unique_mirror(&mut mirrors, line);
             }
         }
     }
 
-    if let Ok(content) = fs::read_to_string(source.html_mirror_file()) {
+    if let Ok(content) = fs::read_to_string(app_resource_path(source.html_mirror_file())) {
         for line in content.lines() {
             push_unique_mirror(&mut mirrors, line);
         }
@@ -2788,7 +2815,7 @@ fn load_search_mirrors(source: SearchSource) -> Vec<String> {
 fn load_diagnostic_recheck_mirrors(source: SearchSource) -> Vec<(String, MirrorStatusSource)> {
     let mut mirrors = Vec::new();
     if let Some(path) = source.api_mirror_file() {
-        if let Ok(content) = fs::read_to_string(path) {
+        if let Ok(content) = fs::read_to_string(app_resource_path(path)) {
             for line in content.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
@@ -2800,7 +2827,7 @@ fn load_diagnostic_recheck_mirrors(source: SearchSource) -> Vec<(String, MirrorS
             }
         }
     }
-    if let Ok(content) = fs::read_to_string(source.html_mirror_file()) {
+    if let Ok(content) = fs::read_to_string(app_resource_path(source.html_mirror_file())) {
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -2818,7 +2845,7 @@ fn load_report_only_diagnostic_statuses(
     source: SearchSource,
     rechecked_mirrors: &[(String, MirrorStatusSource)],
 ) -> Vec<MirrorStatus> {
-    let report_path = source.report_file();
+    let report_path = app_resource_path(source.report_file());
     let content = match fs::read_to_string(report_path) {
         Ok(content) => content,
         Err(_) => return Vec::new(),
@@ -6464,7 +6491,7 @@ impl PanelRenderHelper for AppState {
 
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Subfolder Path:").strong());
-                            ui.label(format!("./stream_cache/{}", torrent.dir_name));
+                            ui.label(cache_item_path(&torrent.dir_name).display().to_string());
                         });
 
                         ui.horizontal(|ui| {
@@ -6673,7 +6700,7 @@ impl PanelRenderHelper for AppState {
                                 if let Some(sequential_mode) = start_mode {
 	                                    let url_to_play = torrent.metadata.as_ref().map(|m| m.url.clone()).unwrap_or_default();
                                         let root_hash_for_launch =
-                                            cache_root_hash(&get_cache_dir().join(&torrent.dir_name), torrent.metadata.as_ref())
+                                            cache_root_hash(&cache_item_path(&torrent.dir_name), torrent.metadata.as_ref())
                                                 .unwrap_or_default();
                                     let dir_to_play = torrent.dir_name.clone();
                                     let children_clone = self.spawned_children.clone();
@@ -6682,17 +6709,16 @@ impl PanelRenderHelper for AppState {
                                     thread::spawn(move || {
 	                                        let mut children = children_clone.lock().unwrap();
 
-		                                        let dest = format!("./stream_cache/{}", dir_to_play);
-		                                        let dest_dir = PathBuf::from(&dest);
-		                                        let local_torrent_path = format!("./stream_cache/{}/movie.torrent", dir_to_play);
+		                                        let dest_dir = cache_item_path(&dir_to_play);
+		                                        let local_torrent_path = dest_dir.join("movie.torrent");
 		                                        let torrent_source = launch_source_from_url_or_hash(
-                                                &url_to_play,
-                                                &root_hash_for_launch,
-                                                "Movie",
-                                                &local_torrent_path,
-                                            );
+	                                                &url_to_play,
+	                                                &root_hash_for_launch,
+	                                                "Movie",
+	                                                &local_torrent_path.display().to_string(),
+	                                            );
 
-		                                        let _ = fs::create_dir_all(&dest_dir);
+			                                        let _ = fs::create_dir_all(&dest_dir);
 
 	                                            initialize_torrent_runtime_state(
                                                 &torrent_status_clone,
@@ -6703,12 +6729,12 @@ impl PanelRenderHelper for AppState {
                                             );
                                             ctx_clone.request_repaint();
 
-		                                        let mut cmd = build_libtorrent_worker_command(
-                                                    torrent_source.as_str(),
-                                                    dest.as_str(),
-                                                    "Movie",
-                                                    sequential_mode,
-                                                    sequential_mode.then_some(20),
+			                                        let mut cmd = build_libtorrent_worker_command(
+	                                                    torrent_source.as_str(),
+	                                                    dest_dir.to_string_lossy().as_ref(),
+	                                                    "Movie",
+	                                                    sequential_mode,
+	                                                    sequential_mode.then_some(20),
                                                 );
 
 			                                        match cmd.spawn() {
@@ -6962,7 +6988,7 @@ impl PanelRenderHelper for AppState {
                                     ui.horizontal(|ui| {
                                         ui.label(egui::RichText::new("Subfolder Path:").strong());
                                         if uses_root_cache {
-                                            ui.label(format!("./stream_cache/{}", torrent.dir_name));
+                                            ui.label(cache_item_path(&torrent.dir_name).display().to_string());
                                         } else {
                                             ui.label(local_cache_path.display().to_string());
                                         }
