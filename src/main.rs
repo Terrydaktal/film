@@ -2544,13 +2544,12 @@ fn ensure_complete_progress_snapshot_for_existing_media(
     }
 }
 
-
-
 fn direct_mpv_args(progress_file: &std::path::Path) -> Vec<String> {
     let mut args = vec![
         "--load-scripts=no".to_string(),
         "--osc=no".to_string(),
         "--ytdl=no".to_string(),
+        "--force-window=immediate".to_string(),
         "--no-resume-playback".to_string(),
         format!(
             "--script-opts=osc-layout=bottombar,osc-seekbarstyle=bar,osc-seekrangestyle=none,osc-torrent_progress_file={}",
@@ -2595,11 +2594,10 @@ fn launch_mpv(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    let proxy_child = proxy_cmd.spawn().map_err(|err| err.to_string())?;
-    {
-        spawned_children.lock().unwrap().push(proxy_child);
-    }
+    let mut proxy_child = proxy_cmd.spawn().map_err(|err| err.to_string())?;
     if !wait_for_local_http_proxy(proxy_port, Duration::from_secs(2)) {
+        let _ = proxy_child.kill();
+        let _ = proxy_child.wait();
         return Err(format!(
             "local stream proxy did not start on 127.0.0.1:{}",
             proxy_port
@@ -2613,18 +2611,29 @@ fn launch_mpv(
         Ok(mut child) => {
             thread::sleep(Duration::from_millis(500));
             match child.try_wait() {
-                Ok(Some(status)) => Err(format!(
-                    "mpv exited immediately with status {}",
-                    status
-                )),
+                Ok(Some(status)) => {
+                    let _ = proxy_child.kill();
+                    let _ = proxy_child.wait();
+                    Err(format!("mpv exited immediately with status {}", status))
+                }
                 Ok(None) => {
-                    spawned_children.lock().unwrap().push(child);
+                    let mut children = spawned_children.lock().unwrap();
+                    children.push(proxy_child);
+                    children.push(child);
                     Ok(())
                 }
-                Err(err) => Err(format!("failed to poll mpv startup: {}", err)),
+                Err(err) => {
+                    let _ = proxy_child.kill();
+                    let _ = proxy_child.wait();
+                    Err(format!("failed to poll mpv startup: {}", err))
+                }
             }
         }
-        Err(err) => Err(err.to_string()),
+        Err(err) => {
+            let _ = proxy_child.kill();
+            let _ = proxy_child.wait();
+            Err(err.to_string())
+        }
     }
 }
 

@@ -418,6 +418,13 @@ class TorrentStreamHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "media file is empty")
             return
         if is_contiguous_stream:
+            available_prefix = contiguous_prefix_end(
+                self.server.progress_path,
+                total_bytes,
+            )
+            if available_prefix <= 0:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "no contiguous media bytes available")
+                return
             range_header = self.headers.get("Range")
             if range_header:
                 try:
@@ -427,8 +434,14 @@ class TorrentStreamHandler(BaseHTTPRequestHandler):
                     self.send_header("Content-Range", f"bytes */{total_bytes}")
                     self.end_headers()
                     return
+                if start >= available_prefix:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self.send_header("Content-Range", f"bytes */{total_bytes}")
+                    self.end_headers()
+                    return
+                end = min(end, available_prefix - 1)
             else:
-                start, end, is_partial = 0, total_bytes - 1, False
+                start, end, is_partial = 0, available_prefix - 1, False
         else:
             try:
                 start, end, is_partial = parse_range_header(
