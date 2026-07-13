@@ -628,7 +628,12 @@ def main() -> int:
                 and args.sequential_start_mib > 0
                 and progress_state is not None
             ):
-                if playback_active:
+                missing_request_offset = (
+                    stream_state.get("missing_request_offset") if stream_state else None
+                )
+                if isinstance(missing_request_offset, (int, float)) and missing_request_offset >= 0:
+                    target_offset = int(missing_request_offset)
+                elif playback_active:
                     urgent_offset = stream_state.get("urgent_offset") if stream_state else None
                     if isinstance(urgent_offset, (int, float)) and urgent_offset >= 0:
                         target_offset = int(urgent_offset)

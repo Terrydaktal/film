@@ -616,6 +616,56 @@ fn find_media_file_excluding(dir: &std::path::Path, excluded_direct_children: &[
     largest_file
 }
 
+fn find_largest_payload_file_excluding(
+    dir: &std::path::Path,
+    excluded_direct_children: &[String],
+) -> Option<PathBuf> {
+    let mut largest_file = None;
+    let mut largest_size = 0;
+
+    fn visit(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        excluded_direct_children: &[String],
+        largest_file: &mut Option<PathBuf>,
+        largest_size: &mut u64,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_under_excluded_direct_child(root, &path, excluded_direct_children) {
+                continue;
+            }
+            if path.is_dir() {
+                visit(
+                    root,
+                    &path,
+                    excluded_direct_children,
+                    largest_file,
+                    largest_size,
+                );
+            } else if path.is_file() && !is_control_artifact_path(&path) {
+                let size = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+                if size > *largest_size {
+                    *largest_size = size;
+                    *largest_file = Some(path);
+                }
+            }
+        }
+    }
+
+    visit(
+        dir,
+        dir,
+        excluded_direct_children,
+        &mut largest_file,
+        &mut largest_size,
+    );
+    largest_file
+}
+
 fn media_progress_score(root: &std::path::Path, media_path: &std::path::Path) -> u64 {
     let mut current = media_path.parent();
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -675,9 +725,52 @@ fn remove_empty_dirs_up_to(mut dir: PathBuf, stop_at: &std::path::Path) {
 
 fn delete_local_media_file(cache_dir: &std::path::Path, media_path: &std::path::Path) {
     let _ = fs::remove_file(media_path);
-    let _ = fs::remove_file(progress_file_path(cache_dir));
+    reset_deleted_torrent_progress(cache_dir);
     if let Some(parent) = media_path.parent() {
         remove_empty_dirs_up_to(parent.to_path_buf(), cache_dir);
+    }
+}
+
+fn reset_deleted_torrent_progress(cache_dir: &std::path::Path) {
+    let file_progress_path = cache_dir.join(".torrent_file_progress.json");
+    let mut total_bytes = None;
+    if let Ok(content) = fs::read_to_string(&file_progress_path) {
+        if let Ok(mut entries) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
+            let mut total = 0_u64;
+            for entry in &mut entries {
+                if let Some(object) = entry.as_object_mut() {
+                    total = total.saturating_add(
+                        object
+                            .get("total")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                    );
+                    object.insert("downloaded".to_string(), serde_json::json!(0));
+                }
+            }
+            if let Ok(reset_content) = serde_json::to_string(&entries) {
+                let _ = fs::write(&file_progress_path, reset_content);
+                total_bytes = Some(total);
+            }
+        }
+    }
+
+    let progress_path = progress_file_path(cache_dir);
+    let mut progress = fs::read_to_string(&progress_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    progress.insert("downloaded_bytes".to_string(), serde_json::json!(0));
+    progress.insert("ranges".to_string(), serde_json::json!([]));
+    progress.remove("playable_prefix_ratio");
+    progress.remove("contiguous_prefix_bytes");
+    progress.remove("player_safe_prefix_bytes");
+    if let Some(total) = total_bytes {
+        progress.insert("total_bytes".to_string(), serde_json::json!(total));
+    }
+    if let Ok(content) = serde_json::to_string(&serde_json::Value::Object(progress)) {
+        let _ = fs::write(progress_path, content);
     }
 }
 
@@ -1907,7 +2000,12 @@ fn format_size(bytes: u64) -> String {
 fn is_control_artifact_path(path: &std::path::Path) -> bool {
     if path
         .components()
-        .any(|component| component.as_os_str() == ".transmission")
+        .any(|component| {
+            matches!(
+                component.as_os_str().to_str(),
+                Some(".transmission") | Some(".hls_stream")
+            )
+        })
     {
         return true;
     }
@@ -1915,6 +2013,10 @@ fn is_control_artifact_path(path: &std::path::Path) -> bool {
         path.file_name().and_then(|name| name.to_str()),
         Some("movie.torrent")
             | Some(".torrent_progress.json")
+            | Some(".torrent_file_progress.json")
+            | Some(".stream_state.json")
+            | Some(".player_safe_probe.log")
+            | Some("torrent.fastresume")
             | Some("metadata.json")
             | Some(".transmission-finished")
     )
@@ -6638,8 +6740,8 @@ impl PanelRenderHelper for AppState {
                                 ui.label(egui::RichText::new("Largest Media File:").strong());
                                 ui.label(path.file_name().unwrap_or_default().to_string_lossy());
                             });
-                            render_torrent_file_progress_dropdown(ui, &parent_cache_path);
                         }
+                        render_torrent_file_progress_dropdown(ui, &parent_cache_path);
 
                         ui.add_space(8.0);
 
@@ -6836,7 +6938,7 @@ impl PanelRenderHelper for AppState {
                 ui.add_space(8.0);
             }
 
-            if let Some(mut options) = torrent_options.clone() {
+            if let Some(options) = torrent_options.clone() {
                 if !options.is_empty() {
                     ui.label(egui::RichText::new("Torrent Options:").strong());
                     ui.add_space(4.0);
@@ -6853,54 +6955,6 @@ impl PanelRenderHelper for AppState {
                         })
                         .collect();
                     let options_for_matching = options.clone();
-
-                    options.sort_by_key(|opt| {
-                        let hash = opt.hash.to_uppercase();
-                        let size_hint = parse_size_to_bytes(&opt.size);
-                        let allow_legacy_size_match = legacy_cache_size_best_matches_option(
-                            &parent_cache_path.join(&opt.quality),
-                            &hash,
-                            &opt.quality,
-                            size_hint,
-                            &options_for_matching,
-                        );
-                        let local_cache_path = torrent_option_cache_path(
-                            &parent_cache_path,
-                            &opt.quality,
-                            &hash,
-                            size_hint,
-                            allow_legacy_size_match,
-                        );
-                        let uses_root_cache = local_cache_path == parent_cache_path;
-                        let excluded_subdirs = if uses_root_cache {
-                            sibling_option_cache_subdirs(&option_cache_markers, &hash)
-                        } else {
-                            Vec::new()
-                        };
-                        let local_media =
-                            find_media_file_excluding(&local_cache_path, &excluded_subdirs);
-                        let has_torrent = local_cache_path.join("movie.torrent").exists();
-                        let has_cache_artifacts = if uses_root_cache {
-                            get_folder_disk_space_filtered(&local_cache_path, &|path| {
-                                !is_under_excluded_direct_child(
-                                    &local_cache_path,
-                                    path,
-                                    &excluded_subdirs,
-                                )
-                            }) > 0
-                        } else {
-                            has_local_cache_artifacts(&local_cache_path)
-                        };
-                        let is_active = {
-                            let map = self.torrent_status.lock().unwrap();
-                            map.get(&hash).map(|s| s.active).unwrap_or(false)
-                        };
-                        (
-                            !is_active,
-                            !(has_torrent || local_media.is_some() || has_cache_artifacts),
-                            opt.quality.clone(),
-                        )
-                    });
 
                     for opt in options {
                         let hash = opt.hash.to_uppercase();
@@ -7156,8 +7210,8 @@ impl PanelRenderHelper for AppState {
                                             ui.label(egui::RichText::new("Largest Media File:").strong());
                                             ui.label(path.file_name().unwrap_or_default().to_string_lossy());
                                         });
-                                        render_torrent_file_progress_dropdown(ui, &local_cache_path);
                                     }
+                                    render_torrent_file_progress_dropdown(ui, &local_cache_path);
                                 }
 
                                 ui.add_space(8.0);
@@ -7352,16 +7406,24 @@ impl PanelRenderHelper for AppState {
                                                 }
                                             }
                                         }
+                                    });
 
+                                    let delete_target = local_media.clone().or_else(|| {
+                                        find_largest_payload_file_excluding(
+                                            &local_cache_path,
+                                            &excluded_subdirs,
+                                        )
+                                    });
+                                    ui.add_enabled_ui(delete_target.is_some(), |ui| {
                                         let delete_file_btn = ui.add_sized(
                                             [150.0, 40.0],
                                             egui::Button::new("🗑 Delete File")
                                                 .fill(egui::Color32::from_rgb(145, 70, 35)),
                                         );
                                         if delete_file_btn.clicked() {
-                                            if let Some(ref media_path) = local_media {
+                                            if let Some(ref payload_path) = delete_target {
                                                 self.pending_delete_file =
-                                                    Some((local_cache_path.clone(), media_path.clone()));
+                                                    Some((local_cache_path.clone(), payload_path.clone()));
                                             }
                                         }
                                     });

@@ -350,7 +350,14 @@ class TorrentStreamProxyServer(ThreadingHTTPServer):
 class TorrentStreamHandler(BaseHTTPRequestHandler):
     server: TorrentStreamProxyServer
 
-    def write_stream_state(self, position: int, available_end: int):
+    def write_stream_state(
+        self,
+        position: int,
+        available_end: int,
+        missing_start: int | None = None,
+        missing_end: int | None = None,
+        missing_reason: str | None = None,
+    ):
         remaining_ready = max(0, available_end - position)
         urgent_offset = None
         if remaining_ready <= URGENT_MARGIN_BYTES:
@@ -362,6 +369,10 @@ class TorrentStreamHandler(BaseHTTPRequestHandler):
             "urgent_offset": urgent_offset,
             "updated_at": time.time(),
         }
+        if missing_start is not None:
+            payload["missing_request_offset"] = missing_start
+            payload["missing_request_end"] = missing_end if missing_end is not None else missing_start
+            payload["missing_request_reason"] = missing_reason or "missing_range"
         try:
             self.server.stream_state_path.write_text(json.dumps(payload, ensure_ascii=True))
         except Exception:
@@ -435,6 +446,13 @@ class TorrentStreamHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     return
                 if start >= available_prefix:
+                    self.write_stream_state(
+                        available_prefix,
+                        available_prefix,
+                        missing_start=start,
+                        missing_end=end,
+                        missing_reason="range_beyond_contiguous_prefix",
+                    )
                     self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
                     self.send_header("Content-Range", f"bytes */{total_bytes}")
                     self.end_headers()
