@@ -2651,6 +2651,8 @@ fn direct_mpv_args(progress_file: &std::path::Path) -> Vec<String> {
         "--load-scripts=no".to_string(),
         "--osc=no".to_string(),
         "--ytdl=no".to_string(),
+        "--audio-channels=stereo".to_string(),
+        "--volume-max=300".to_string(),
         "--force-window=immediate".to_string(),
         "--no-resume-playback".to_string(),
         format!(

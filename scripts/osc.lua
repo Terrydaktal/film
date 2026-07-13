@@ -135,6 +135,8 @@ for i = 1, 99 do
     user_opts["custom_button_" .. i .. "_wheel_down_command"] = ""
     user_opts["custom_button_" .. i .. "_wheel_up_command"] = ""
 end
+user_opts.custom_button_1_content = "DB"
+user_opts.custom_button_1_mbtn_left_command = "script-message dialogue-boost-toggle"
 
 local icon_font = "mpv-osd-symbols"
 
@@ -193,6 +195,19 @@ local layouts = {}
 local is_december = os.date("*t").month == 12
 local UNICODE_MINUS = string.char(0xe2, 0x88, 0x92)  -- UTF-8 for U+2212 MINUS SIGN
 local last_custom_button = 0
+local dialogue_boost_enabled = false
+local dialogue_boost_filter = "@dialogue_boost:lavfi=[dynaudnorm=f=250:g=15:p=0.9]"
+
+local function toggle_dialogue_boost()
+    if dialogue_boost_enabled then
+        mp.commandv("af", "remove", "@dialogue_boost")
+        dialogue_boost_enabled = false
+    else
+        mp.commandv("af", "add", dialogue_boost_filter)
+        dialogue_boost_enabled = true
+    end
+    mp.osd_message("Dialogue Boost: " .. (dialogue_boost_enabled and "On" or "Off"), 2)
+end
 
 local function osc_color_convert(color)
     return color:sub(6,7) .. color:sub(4,5) ..  color:sub(2,3)
@@ -3087,6 +3102,8 @@ end
 
 mp.register_script_message("osc-visibility", visibility_mode)
 mp.register_script_message("osc-show", show_osc)
+mp.register_script_message("dialogue-boost-toggle", toggle_dialogue_boost)
+mp.add_key_binding("D", "dialogue-boost-toggle", toggle_dialogue_boost)
 mp.register_script_message("osc-hide", function ()
     if user_opts.visibility == "auto" then
         osc_visible(false)
