@@ -1038,24 +1038,28 @@ where
                         if let Some(ref downloaded) = event.downloaded {
                             write_torrent_progress(&progress_dir, downloaded);
                         }
-                        let mut map = status_map.lock().unwrap();
-                        if let Some(s) = map.get_mut(&status_key) {
-                            if let Some(speed) = event.speed {
-                                s.speed = speed;
-                            }
-                            if let Some(downloaded) = event.downloaded {
-                                s.downloaded =
-                                    normalize_worker_downloaded_text(&progress_dir, &downloaded);
-                            }
-                            if let Some(peers) = event.peers {
-                                s.peers = peers;
-                            }
-                            s.detail = event.detail.unwrap_or_default();
-                            if event.complete.unwrap_or(false) {
-                                s.active = false;
-                                s.speed = "Complete".to_string();
-                                s.peers.clear();
-                                s.detail.clear();
+                        {
+                            let mut map = status_map.lock().unwrap();
+                            if let Some(s) = map.get_mut(&status_key) {
+                                if let Some(speed) = event.speed {
+                                    s.speed = speed;
+                                }
+                                if let Some(downloaded) = event.downloaded {
+                                    s.downloaded = normalize_worker_downloaded_text(
+                                        &progress_dir,
+                                        &downloaded,
+                                    );
+                                }
+                                if let Some(peers) = event.peers {
+                                    s.peers = peers;
+                                }
+                                s.detail = event.detail.unwrap_or_default();
+                                if event.complete.unwrap_or(false) {
+                                    s.active = false;
+                                    s.speed = "Complete".to_string();
+                                    s.peers.clear();
+                                    s.detail.clear();
+                                }
                             }
                         }
                         if event.complete.unwrap_or(false) {
@@ -1109,33 +1113,38 @@ where
                 if let Some(ref downloaded) = update.downloaded {
                     write_torrent_progress(&progress_dir, downloaded);
                 }
-                let mut map = status_map.lock().unwrap();
-                if let Some(s) = map.get_mut(&status_key) {
-                    if let Some(speed) = update.speed {
-                        s.speed = speed;
-                    }
-                    if let Some(downloaded) = update.downloaded {
-                        s.downloaded = normalized_torrent_progress_text(&progress_dir, &downloaded)
+                {
+                    let mut map = status_map.lock().unwrap();
+                    if let Some(s) = map.get_mut(&status_key) {
+                        if let Some(speed) = update.speed {
+                            s.speed = speed;
+                        }
+                        if let Some(downloaded) = update.downloaded {
+                            s.downloaded = normalized_torrent_progress_text(
+                                &progress_dir,
+                                &downloaded,
+                            )
                             .unwrap_or(downloaded);
-                    }
-                    if let Some(peers) = update.peers {
-                        s.peers = peers;
-                    }
-                    if update.complete || status_speed_is_rate(s.speed.trim()) {
-                        s.detail.clear();
-                    }
-                    if update.complete {
-                        s.active = false;
-                        s.speed = "Complete".to_string();
+                        }
+                        if let Some(peers) = update.peers {
+                            s.peers = peers;
+                        }
+                        if update.complete || status_speed_is_rate(s.speed.trim()) {
+                            s.detail.clear();
+                        }
+                        if update.complete {
+                            s.active = false;
+                            s.speed = "Complete".to_string();
+                        }
                     }
                 }
-                    if update.complete {
-                        mark_torrent_complete(
-                            &status_map,
-                            &status_key,
-                            &progress_dir,
-                            total_hint,
-                            &ctx,
+                if update.complete {
+                    mark_torrent_complete(
+                        &status_map,
+                        &status_key,
+                        &progress_dir,
+                        total_hint,
+                        &ctx,
                     );
                 }
                 ctx.request_repaint();
@@ -4251,8 +4260,9 @@ fn movie_runtime_label(metadata: Option<&MovieMetadata>) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn group_sidebar_progress_text(group: &MovieGroup) -> String {
+fn group_sidebar_progress(group: &MovieGroup) -> (String, bool) {
     let mut entries = Vec::new();
+    let mut is_complete = false;
 
     for torrent in &group.torrents {
         let cache_dir_path = get_cache_dir().join(&torrent.dir_name);
@@ -4288,6 +4298,7 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
             } else {
                 0.0
             };
+            is_complete |= total > 0 && live_downloaded >= total;
             entries.push(format!(
                 "{} / {} ({:.2}%)",
                 format_size(live_downloaded),
@@ -4338,6 +4349,7 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
                         } else {
                             0.0
                         };
+                        is_complete |= total > 0 && downloaded >= total;
                         entries.push(format!(
                             "{} / {} ({:.2}%)",
                             format_size(downloaded),
@@ -4352,7 +4364,7 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
     entries.sort();
     entries.dedup();
     if !entries.is_empty() {
-        return entries.join(" ");
+        return (entries.join(" "), is_complete);
     }
 
     let live_disk_used: u64 = group
@@ -4372,7 +4384,7 @@ fn group_sidebar_progress_text(group: &MovieGroup) -> String {
             }
         })
         .sum();
-    format!("0 B ({})", format_size(live_disk_used))
+    (format!("0 B ({})", format_size(live_disk_used)), false)
 }
 
 fn has_local_cache_artifacts(cache_dir: &std::path::Path) -> bool {
@@ -4940,16 +4952,6 @@ impl AppState {
 
         let torrent_status = Arc::new(Mutex::new(TorrentStatusMap::new()));
         let spawned_children = Arc::new(Mutex::new(Vec::new()));
-        let repaint_ctx = ctx.clone();
-
-        // Spawn background polling thread to repaint the UI periodically (every 1 second) to capture real-time file size increases
-        thread::spawn(move || {
-            loop {
-                repaint_ctx.request_repaint();
-                thread::sleep(std::time::Duration::from_secs(1));
-            }
-        });
-
         Self {
             active_tab: AppTab::Library,
             movies,
@@ -5314,6 +5316,16 @@ impl eframe::App for AppState {
             }
         }
 
+        if self
+            .torrent_status
+            .lock()
+            .unwrap()
+            .values()
+            .any(|status| status.active)
+        {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+
         if (ctx.pixels_per_point() - self.ui_scale).abs() > f32::EPSILON {
             ctx.set_pixels_per_point(self.ui_scale);
         }
@@ -5582,98 +5594,8 @@ impl eframe::App for AppState {
                                  })
                              };
  
-                             // Find the highest download percentage and check if complete
-	                             let mut max_pct = 0.0;
-		                             let mut is_complete = false;
-		                             for t in &group.torrents {
-		                                 let cache_dir_path = get_cache_dir().join(&t.dir_name);
-                                     let option_cache_markers: Vec<(String, String, String)> = t
-                                         .metadata
-                                         .as_ref()
-                                         .and_then(|meta| meta.torrent_options.as_ref())
-                                         .map(|options| {
-                                             options
-                                                 .iter()
-                                                 .map(|opt| {
-                                                     let hash = opt.hash.to_uppercase();
-                                                     (
-                                                         hash.clone(),
-                                                         opt.quality.clone(),
-                                                         torrent_option_cache_subdir(&hash),
-                                                     )
-                                                 })
-                                                 .collect()
-                                         })
-                                         .unwrap_or_default();
-		                                 if let Some(ref meta) = t.metadata {
-		                                     if let Some(ref options) = meta.torrent_options {
-		                                         for opt in options {
-                                                 let hash = opt.hash.to_uppercase();
-                                                 let size_hint = parse_size_to_bytes(&opt.size);
-                                                 let allow_legacy_size_match =
-                                                     legacy_cache_size_best_matches_option(
-                                                         &cache_dir_path.join(&opt.quality),
-                                                         &hash,
-                                                         &opt.quality,
-                                                         size_hint,
-                                                         options,
-                                                     );
-	                                                 let option_path = torrent_option_cache_path(
-	                                                     &cache_dir_path,
-	                                                     &opt.quality,
-	                                                     &hash,
-	                                                     size_hint,
-                                                     allow_legacy_size_match,
-	                                                 );
-                                                 let uses_root_cache = option_path == cache_dir_path;
-                                                 let excluded_subdirs = if uses_root_cache {
-                                                     sibling_option_cache_subdirs(
-                                                         &option_cache_markers,
-                                                         &hash,
-                                                     )
-                                                 } else {
-                                                     Vec::new()
-                                                 };
-	                                             if let Some((dl, tot)) = get_live_downloaded_and_total_excluding(
-                                                     &option_path,
-                                                     parse_size_to_bytes(&opt.size),
-                                                     &excluded_subdirs,
-                                                 ) {
-	                                                 if tot > 0 {
-	                                                     let pct = (dl as f64 / tot as f64) * 100.0;
-	                                                     if pct > max_pct {
-                                                         max_pct = pct;
-                                                     }
-                                                     if dl >= tot {
-                                                         is_complete = true;
-                                                     }
-                                                 }
-                                             }
-		                                         }
-		                                     }
-		                                 }
-		                                 if t
-                                         .metadata
-                                         .as_ref()
-                                         .and_then(|meta| meta.torrent_options.as_ref())
-                                         .is_none_or(|options| options.is_empty())
-                                         && let Some((dl, tot)) = get_live_downloaded_and_total_excluding(
-                                             &cache_dir_path,
-                                             Some(t.logical_size_bytes),
-                                             &[],
-                                         )
-                                     {
-		                                     if tot > 0 {
-		                                         let pct = (dl as f64 / tot as f64) * 100.0;
-                                         if pct > max_pct {
-                                             max_pct = pct;
-                                         }
-                                         if dl >= tot {
-                                             is_complete = true;
-                                         }
-                                     }
-                                 }
-                             }
+	                             let (progress_text, is_complete) =
+	                                 group_sidebar_progress(group);
  
                              let prefix = if is_downloading {
                                  "⬇"
@@ -5688,9 +5610,7 @@ impl eframe::App for AppState {
                              } else {
                                  String::new()
                              };
-                             let progress_text = group_sidebar_progress_text(group);
-
-                             let item_text = format!(
+	                             let item_text = format!(
                                  "{}{}\n{}",
                                  title,
                                  suffix,
